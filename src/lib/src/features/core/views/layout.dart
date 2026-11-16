@@ -213,7 +213,8 @@ class _AppLayoutState extends State<AppLayout> {
           return const SizedBox.shrink();
         }
         return Align(
-          alignment: MediaQuery.sizeOf(context).width < 600
+          alignment: (Platform.isAndroid ||
+                  MediaQuery.sizeOf(context).width < 600)
               ? Alignment.bottomCenter
               : Alignment.centerLeft,
           child: ValueListenableBuilder<double>(
