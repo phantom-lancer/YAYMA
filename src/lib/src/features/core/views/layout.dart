@@ -18,6 +18,7 @@ import 'package:yayma/src/features/home/views/home_view.dart';
 import 'package:yayma/src/features/library/views/library_view.dart';
 import 'package:yayma/src/features/library/views/playlist_view.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
+import 'package:yayma/src/features/playback/views/wave_view.dart';
 import 'package:yayma/src/features/search/views/search_view.dart';
 import 'package:yayma/src/features/settings/views/settings_view.dart';
 
@@ -414,6 +415,10 @@ class _WindowContent extends StatelessWidget {
           }
           // Keep webview/settings content above the Android system buttons.
           bottomPadding += MediaQuery.viewPaddingOf(context).bottom;
+        } else if (state.section == AppSection.wave && isNarrow) {
+          // Keep the wave controls and start button clear of the floating
+          // Android player bar and bottom navigation.
+          bottomPadding = 96 + MediaQuery.viewPaddingOf(context).bottom;
         } else if (isHome && screenWidth < 600) {
           // Home is centered non-scrollable content: its bottom row
           // (wave settings, repeat, quality) must stay above the floating
@@ -465,14 +470,7 @@ class _WindowContent extends StatelessWidget {
           kind: parts.length > 1 ? parts[1] : null,
         );
       case AppSection.wave:
-        return Center(
-          child: Text(
-            'Волна',
-            style: TextStyle(
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-          ),
-        );
+        return const MyWaveView();
       case AppSection.account:
         return const SettingsView();
       case AppSection.yandexId:

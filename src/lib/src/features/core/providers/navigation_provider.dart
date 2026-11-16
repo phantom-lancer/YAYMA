@@ -40,6 +40,7 @@ class NavState {
 final List<AppSection> rootSections = [
   if (!Platform.isAndroid) AppSection.home,
   AppSection.search,
+  if (Platform.isAndroid) AppSection.wave,
   AppSection.liked,
   AppSection.playlists,
   AppSection.account,

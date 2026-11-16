@@ -91,7 +91,7 @@ class _FloatingNavBarState extends State<FloatingNavBar>
             _isNavbarHovered ||
             _isHovered ||
             _isAccountMenuOpen;
-        final isNarrow = MediaQuery.sizeOf(context).width < 600;
+        final isNarrow = Platform.isAndroid || MediaQuery.sizeOf(context).width < 600;
         // Edge-to-edge: app draws behind the Android system navigation bar,
         // so lift the floating navbar above the 3-button/gesture bar.
         // viewPadding stays stable when the keyboard opens.
@@ -166,6 +166,14 @@ class _FloatingNavBarState extends State<FloatingNavBar>
             onTap: () => setSection(AppSection.search),
             isNarrow: isNarrow,
           ),
+          if (Platform.isAndroid)
+            _NavIcon(
+              icon: Icons.radio_rounded,
+              isSelected: currentSection == AppSection.wave,
+              onTap: () => setSection(AppSection.wave),
+              isNarrow: isNarrow,
+              tooltip: 'Моя волна',
+            ),
           _NavIcon(
             icon: Icons.library_music_rounded,
             isSelected:
@@ -631,12 +639,14 @@ class _NavIcon extends StatelessWidget {
   final bool isSelected;
   final VoidCallback onTap;
   final bool isNarrow;
+  final String? tooltip;
 
   const _NavIcon({
     required this.icon,
     required this.isSelected,
     required this.onTap,
     this.isNarrow = false,
+    this.tooltip,
   });
 
   @override
@@ -666,6 +676,7 @@ class _NavIcon extends StatelessWidget {
                 : null,
           ),
           child: IconButton(
+            tooltip: tooltip,
             onPressed: onTap,
             icon: Icon(
               icon,

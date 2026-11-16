@@ -11,6 +11,19 @@ import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/features/playback/providers/wave_provider.dart';
 import 'package:yayma/src/rust/api/models.dart';
 
+/// Full Android tab for configuring and starting a personal radio session.
+/// The same panel is reused by the desktop quick-settings overlay.
+class MyWaveView extends StatelessWidget {
+  const MyWaveView({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const WaveSettingsPanel(onSelected: _keepWavePageOpen);
+  }
+}
+
+void _keepWavePageOpen() {}
+
 /// Opens the "Моя волна" settings sheet (stations, moods, seeds).
 Future<void> showWaveSettingsSheet(BuildContext context) {
   return showAppBottomSheet<void>(
@@ -411,6 +424,7 @@ class _RoundedChip extends StatelessWidget {
       ),
       onSelected: (_) {
         unawaited(WaveController.toggleStation(item.seed));
+        onSelected();
       },
       backgroundColor: Theme.of(
         context,
@@ -459,6 +473,7 @@ class _CharacterCard extends StatelessWidget {
       child: InkWell(
         onTap: () {
           unawaited(WaveController.toggleStation(seed));
+          onSelected();
         },
         borderRadius: BorderRadius.circular(20),
         child: Container(
@@ -521,6 +536,7 @@ class _MoodCircle extends StatelessWidget {
     return InkWell(
       onTap: () {
         unawaited(WaveController.toggleStation(mood.seed));
+        onSelected();
       },
       borderRadius: BorderRadius.circular(40),
       child: Column(
