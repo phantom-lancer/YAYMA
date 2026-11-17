@@ -96,7 +96,15 @@ class _FloatingNavBarState extends State<FloatingNavBar>
                 ? 24.0
                 : AppRadius.xxxl;
         final navAlpha = isAppleGlass ? 0.34 : isYandexStyle ? 0.72 : 0.5;
-        final navBlur = isAppleGlass ? 30.0 : isYandexStyle ? 20.0 : 16.0;
+        final isCurrentStyle = Platform.isAndroid &&
+            appearance == AndroidAppearanceProfile.current;
+        final navBlur = isAppleGlass
+            ? 30.0
+            : isYandexStyle
+                ? 20.0
+                : isCurrentStyle
+                    ? 16.0
+                    : (isHome ? 0.0 : 2.0);
 
         final isVisible =
             !isHome ||
