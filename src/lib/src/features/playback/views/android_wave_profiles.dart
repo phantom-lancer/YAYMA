@@ -276,14 +276,16 @@ class _YandexNowPlaying extends StatelessWidget {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               IconButton(
-                onPressed: PlaybackController.prev,
+                onPressed: hasTrack ? PlaybackController.prev : null,
                 icon: const Icon(Icons.skip_previous_rounded),
                 color: Colors.white,
                 iconSize: 31,
               ),
               const SizedBox(width: 12),
               IconButton.filled(
-                onPressed: PlaybackController.togglePlay,
+                onPressed: hasTrack
+                    ? PlaybackController.togglePlay
+                    : () => unawaited(WaveController.startMyWave()),
                 style: IconButton.styleFrom(
                   backgroundColor: const Color(0xFFFF5C62),
                   foregroundColor: Colors.white,
@@ -296,7 +298,7 @@ class _YandexNowPlaying extends StatelessWidget {
               ),
               const SizedBox(width: 12),
               IconButton(
-                onPressed: PlaybackController.next,
+                onPressed: hasTrack ? PlaybackController.next : null,
                 icon: const Icon(Icons.skip_next_rounded),
                 color: Colors.white,
                 iconSize: 31,
@@ -542,16 +544,22 @@ class AppleMusicWaveView extends StatelessWidget {
                             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                             children: [
                               IconButton(
-                                onPressed: PlaybackController.prev,
+                                onPressed: meta.id == null
+                                    ? null
+                                    : PlaybackController.prev,
                                 icon: const Icon(Icons.skip_previous_rounded),
                                 iconSize: 38,
                               ),
                               _ApplePlayButton(
                                 playing: playing,
-                                onPressed: PlaybackController.togglePlay,
+                                onPressed: meta.id == null
+                                    ? () => unawaited(WaveController.startMyWave())
+                                    : PlaybackController.togglePlay,
                               ),
                               IconButton(
-                                onPressed: PlaybackController.next,
+                                onPressed: meta.id == null
+                                    ? null
+                                    : PlaybackController.next,
                                 icon: const Icon(Icons.skip_next_rounded),
                                 iconSize: 38,
                               ),
