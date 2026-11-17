@@ -311,13 +311,12 @@ class _SettingsViewState extends State<SettingsView> {
       const SizedBox(height: 32),
       const _SectionTitle(title: 'Визуальные эффекты'),
       const SizedBox(height: 20),
-      // The shared wave shader now runs on Android as well.
-      if (!Platform.isAndroid) ...[
-        SignalBuilder(
+      // The shared PC shader is available on Android as well.
+      SignalBuilder(
           builder: (context) {
             final enabled = vibeVisibleSignal.value;
             return _SettingItem(
-              title: 'Показывать волну',
+              title: 'Показывать анимацию волны',
               subtitle: 'Динамический фон, реагирующий на музыку',
               icon: Icons.waves_rounded,
               onTap: () => unawaited(_toggleVibeVisibility(!enabled)),
@@ -359,7 +358,6 @@ class _SettingsViewState extends State<SettingsView> {
           },
         ),
         const SizedBox(height: 8),
-      ],
       SignalBuilder(
         builder: (context) {
           final enabled = blurEffectsEnabledSignal.value;
