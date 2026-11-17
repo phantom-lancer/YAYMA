@@ -10,7 +10,6 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:yayma/src/app/session.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
 import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
-import 'package:yayma/src/features/core/providers/android_player_preferences.dart' show AndroidAppearanceProfile, androidAppearanceProfileSignal;
 import 'package:yayma/src/features/core/providers/notification_provider.dart';
 import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 import 'package:yayma/src/features/core/services/global_hotkey_service.dart';
