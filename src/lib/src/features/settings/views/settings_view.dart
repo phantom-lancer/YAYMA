@@ -1242,64 +1242,94 @@ class _SettingItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final primaryColor = Theme.of(context).colorScheme.primary;
-    final onSurfaceVariant = Theme.of(context).colorScheme.onSurfaceVariant;
-    final onSurface = Theme.of(context).colorScheme.onSurface;
+    final scheme = Theme.of(context).colorScheme;
     final isNarrow = context.isNarrow;
-    return InkWell(
-      onTap: onTap,
-      onHover: (_) {},
-      hoverColor: onSurface.withValues(alpha: 0.06),
-      borderRadius: BorderRadius.circular(AppRadius.sm),
-      child: Padding(
-        padding: EdgeInsets.symmetric(
-          horizontal: isNarrow ? 8 : 12,
-          vertical: isNarrow ? 8 : 10,
-        ),
-        child: Row(
-          children: [
-            Container(
-              padding: EdgeInsets.all(isNarrow ? 8 : 10),
-              decoration: BoxDecoration(
-                color: primaryColor.withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(AppRadius.sm),
-              ),
-              child: Icon(icon, color: primaryColor, size: isNarrow ? 20 : 22),
+    final radius = BorderRadius.circular(AppRadius.lg);
+
+    return Material(
+      color: Colors.transparent,
+      borderRadius: radius,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: radius,
+        splashColor: scheme.primary.withValues(alpha: 0.10),
+        highlightColor: scheme.onSurface.withValues(alpha: 0.035),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOutCubic,
+          padding: EdgeInsets.symmetric(
+            horizontal: isNarrow ? 12 : 16,
+            vertical: isNarrow ? 11 : 13,
+          ),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHigh.withValues(alpha: 0.30),
+            borderRadius: radius,
+            border: Border.all(
+              color: scheme.onSurface.withValues(alpha: 0.075),
             ),
-            SizedBox(width: isNarrow ? 12 : 16),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: TextStyle(
-                      color: onSurface,
-                      fontSize: isNarrow ? 15 : 16,
-                      fontWeight: FontWeight.w600,
-                    ),
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: isNarrow ? 40 : 44,
+                height: isNarrow ? 40 : 44,
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      scheme.primary.withValues(alpha: 0.20),
+                      scheme.primary.withValues(alpha: 0.07),
+                    ],
                   ),
-                  const SizedBox(height: 3),
-                  Text(
-                    subtitle,
-                    style: TextStyle(
-                      color: onSurfaceVariant,
-                      fontSize: isNarrow ? 12 : 14,
-                    ),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
+                  borderRadius: BorderRadius.circular(AppRadius.md),
+                  border: Border.all(
+                    color: scheme.primary.withValues(alpha: 0.13),
                   ),
-                ],
-              ),
-            ),
-            SizedBox(width: isNarrow ? 8 : 12),
-            trailing ??
-                Icon(
-                  Icons.chevron_right_rounded,
-                  color: onSurfaceVariant,
-                  size: isNarrow ? 22 : 24,
                 ),
-          ],
+                child: Icon(
+                  icon,
+                  color: scheme.primary,
+                  size: isNarrow ? 20 : 22,
+                ),
+              ),
+              SizedBox(width: isNarrow ? 12 : 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        color: scheme.onSurface,
+                        fontSize: isNarrow ? 14 : 15,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: -0.1,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        color: scheme.onSurfaceVariant,
+                        fontSize: isNarrow ? 11.5 : 12.5,
+                        height: 1.3,
+                      ),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(width: isNarrow ? 8 : 12),
+              trailing ??
+                  Icon(
+                    Icons.chevron_right_rounded,
+                    color: scheme.onSurfaceVariant,
+                    size: isNarrow ? 22 : 24,
+                  ),
+            ],
+          ),
         ),
       ),
     );
