@@ -738,12 +738,12 @@ class _WaveEnergyPainter extends CustomPainter {
     if (values.length < 8) return;
 
     final time = values[0];
-    final bass = values[2].clamp(0.0, 1.0);
-    final mids = values[3].clamp(0.0, 1.0);
-    final highs = values[4].clamp(0.0, 1.0);
-    final bassReact = values[5].clamp(0.0, 1.0);
-    final midReact = values[6].clamp(0.0, 1.0);
-    final highReact = values[7].clamp(0.0, 1.0);
+    final bass = values[2].clamp(0.0, 1.0).toDouble();
+    final mids = values[3].clamp(0.0, 1.0).toDouble();
+    final highs = values[4].clamp(0.0, 1.0).toDouble();
+    final bassReact = values[5].clamp(0.0, 1.0).toDouble();
+    final midReact = values[6].clamp(0.0, 1.0).toDouble();
+    final highReact = values[7].clamp(0.0, 1.0).toDouble();
 
     final bands = [
       (primary, bass, bassReact, 1.0),
