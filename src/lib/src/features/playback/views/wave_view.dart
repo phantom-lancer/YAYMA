@@ -1,38 +1,165 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 
 import 'package:flutter/rendering.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
+import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
+import 'package:yayma/src/features/core/theme/app_tokens.dart';
+import 'package:yayma/src/features/core/views/widgets/app_cover.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
 import 'package:yayma/src/features/core/views/widgets/responsive.dart';
 import 'package:yayma/src/features/core/views/widgets/smooth_scroll.dart';
+import 'package:yayma/src/features/core/views/widgets/track_elements.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/features/playback/providers/wave_provider.dart';
 import 'package:yayma/src/rust/api/models.dart';
 
-/// Full Android tab for configuring and starting a personal radio session.
-/// The same panel is reused by the desktop quick-settings overlay.
+/// Android's My Wave home: playback first, tuning second.
+/// It reuses the app's live playback state, cached artwork and visual settings.
 class MyWaveView extends StatelessWidget {
   const MyWaveView({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return const WaveSettingsPanel(onSelected: _keepWavePageOpen);
+    return SignalBuilder(
+      builder: (context) {
+        final meta = trackMetadataSignal();
+        final seeds = currentWaveSeedsSignal();
+        final horizontalPadding = context.horizontalPadding;
+        final scheme = Theme.of(context).colorScheme;
+
+        return Stack(
+          clipBehavior: Clip.none,
+          children: [
+            if (meta.coverUrl != null && blurEffectsEnabledSignal.value)
+              _WaveAmbientBackdrop(coverUrl: meta.coverUrl!),
+            SingleChildScrollView(
+              physics: const BouncingScrollPhysics(),
+              padding: EdgeInsets.fromLTRB(
+                horizontalPadding,
+                24,
+                horizontalPadding,
+                140,
+              ),
+              child: Align(
+                alignment: Alignment.topCenter,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 720),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          const Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                CommonPageTitle(title: 'Моя волна'),
+                                SizedBox(height: 6),
+                                Text(
+                                  'Музыка, которая подстраивается под тебя',
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    color: Colors.white70,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          IconButton.filledTonal(
+                            tooltip: 'Настроить волну',
+                            onPressed: () => showWaveSettingsSheet(context),
+                            icon: const Icon(Icons.tune_rounded),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 24),
+                      const _WaveNowPlayingCard(),
+                      const SizedBox(height: 28),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              'БЫСТРЫЙ ВЫБОР',
+                              style: Theme.of(context).textTheme.labelLarge
+                                  ?.copyWith(
+                                    color: scheme.onSurfaceVariant,
+                                    letterSpacing: 1.4,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                            ),
+                          ),
+                          TextButton.icon(
+                            onPressed: () => showWaveSettingsSheet(context),
+                            icon: const Icon(Icons.tune_rounded, size: 17),
+                            label: const Text('Все настройки'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: _WavePresetCard(
+                              title: 'Любимое',
+                              subtitle: 'Знакомое',
+                              icon: Icons.favorite_rounded,
+                              seed: 'personal:collection',
+                              selected: seeds.contains('personal:collection'),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: _WavePresetCard(
+                              title: 'Открывать',
+                              subtitle: 'Новое',
+                              icon: Icons.auto_awesome_rounded,
+                              seed: 'personal:never-heard',
+                              selected: seeds.contains('personal:never-heard'),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: _WavePresetCard(
+                              title: 'Хиты',
+                              subtitle: 'Популярное',
+                              icon: Icons.bolt_rounded,
+                              seed: 'personal:hits',
+                              selected: seeds.contains('personal:hits'),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 18),
+                      _WaveSettingsTile(
+                        activeFilters: seeds.length,
+                        onTap: () => showWaveSettingsSheet(context),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
   }
 }
 
-void _keepWavePageOpen() {}
-
-/// Opens the "Моя волна" settings sheet (stations, moods, seeds).
+/// The same station settings, now opened separately from the main player page.
 Future<void> showWaveSettingsSheet(BuildContext context) {
   return showAppBottomSheet<void>(
     context: context,
     showDragHandle: true,
     builder: (context) => DraggableScrollableSheet(
-      initialChildSize: 0.6,
-      minChildSize: 0.4,
-      maxChildSize: 0.9,
+      initialChildSize: 0.68,
+      minChildSize: 0.42,
+      maxChildSize: 0.92,
       expand: false,
       snap: true,
       builder: (context, scrollController) => WaveSettingsPanel(
@@ -41,6 +168,494 @@ Future<void> showWaveSettingsSheet(BuildContext context) {
       ),
     ),
   );
+}
+
+class _WaveAmbientBackdrop extends StatelessWidget {
+  final String coverUrl;
+
+  const _WaveAmbientBackdrop({required this.coverUrl});
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned(
+      top: -108,
+      right: -118,
+      child: IgnorePointer(
+        child: Opacity(
+          opacity: 0.16,
+          child: ImageFiltered(
+            imageFilter: ui.ImageFilter.blur(sigmaX: 38, sigmaY: 38),
+            child: AppCover(
+              coverUrl: coverUrl,
+              size: 360,
+              radius: AppRadius.xxxl,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _WaveNowPlayingCard extends StatelessWidget {
+  const _WaveNowPlayingCard();
+
+  @override
+  Widget build(BuildContext context) {
+    return SignalBuilder(
+      builder: (context) {
+        final meta = trackMetadataSignal();
+        final progress = trackProgressSignal();
+        final playing = stablePlayingSignal();
+        final liked = isLikedSignal();
+        final buffering = showBufferingIndicatorSignal();
+        final trackId = meta.id;
+        final hasTrack = trackId != null;
+        final scheme = Theme.of(context).colorScheme;
+        final coverSize = (MediaQuery.sizeOf(context).width - 100)
+            .clamp(156.0, 216.0);
+
+        final duration = progress.durationMs;
+        final position = progress.positionMs.clamp(0.0, duration).toDouble();
+        final fraction = duration > 0
+            ? (position / duration).clamp(0.0, 1.0)
+            : 0.0;
+
+        return _WaveGlassSurface(
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 18),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    Icons.graphic_eq_rounded,
+                    size: 18,
+                    color: scheme.primary,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      hasTrack ? 'СЕЙЧАС ИГРАЕТ' : 'ПЕРСОНАЛЬНАЯ РАДИОСТАНЦИЯ',
+                      style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                        letterSpacing: 1.5,
+                        fontWeight: FontWeight.w800,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                  _WaveLiveBadge(
+                    label: buffering
+                        ? 'ЗАГРУЗКА'
+                        : playing
+                        ? 'В ЭФИРЕ'
+                        : 'ПАУЗА',
+                    active: playing || buffering,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 22),
+              if (hasTrack && meta.coverUrl != null)
+                AppCover(
+                  coverUrl: meta.coverUrl,
+                  size: coverSize,
+                  radius: AppRadius.xxl,
+                  canExpand: true,
+                )
+              else
+                Container(
+                  width: coverSize,
+                  height: coverSize,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(AppRadius.xxl),
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        scheme.primary.withValues(alpha: 0.32),
+                        scheme.secondary.withValues(alpha: 0.16),
+                        scheme.surfaceContainerHighest,
+                      ],
+                    ),
+                    border: Border.all(
+                      color: scheme.onSurface.withValues(alpha: 0.08),
+                    ),
+                  ),
+                  child: Icon(
+                    Icons.graphic_eq_rounded,
+                    size: 76,
+                    color: scheme.onSurface.withValues(alpha: 0.7),
+                  ),
+                ),
+              const SizedBox(height: 20),
+              Text(
+                hasTrack ? meta.title : 'Волна ждёт запуска',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                  fontSize: 23,
+                  height: 1.12,
+                  letterSpacing: -0.5,
+                  fontWeight: FontWeight.w900,
+                  color: scheme.onSurface,
+                ),
+              ),
+              if (hasTrack && meta.version != null && meta.version!.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 3),
+                  child: Text(
+                    meta.version!,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: scheme.onSurfaceVariant.withValues(alpha: 0.65),
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+              if (hasTrack && meta.artists.isNotEmpty) ...[
+                const SizedBox(height: 7),
+                ArtistNamesWidget(
+                  artists: meta.artists,
+                  fontSize: 14,
+                  color: scheme.onSurfaceVariant,
+                  alignment: WrapAlignment.center,
+                  maxLines: 1,
+                ),
+              ] else if (!hasTrack) ...[
+                const SizedBox(height: 7),
+                Text(
+                  'Запусти радио, и музыка начнёт подбираться автоматически',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: scheme.onSurfaceVariant,
+                    fontSize: 13,
+                    height: 1.4,
+                  ),
+                ),
+              ],
+              const SizedBox(height: 22),
+              if (hasTrack) ...[
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(AppRadius.full),
+                  child: LinearProgressIndicator(
+                    value: fraction,
+                    minHeight: 4,
+                    backgroundColor: scheme.onSurface.withValues(alpha: 0.10),
+                    valueColor: AlwaysStoppedAnimation<Color>(scheme.primary),
+                  ),
+                ),
+                const SizedBox(height: 7),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      formatDuration(position.round()),
+                      style: TextStyle(
+                        color: scheme.onSurfaceVariant,
+                        fontSize: 11,
+                        fontFeatures: const [ui.FontFeature.tabularFigures()],
+                      ),
+                    ),
+                    Text(
+                      formatDuration(duration.round()),
+                      style: TextStyle(
+                        color: scheme.onSurfaceVariant,
+                        fontSize: 11,
+                        fontFeatures: const [ui.FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+              ],
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  IconButton.filledTonal(
+                    tooltip: 'В предыдущий трек',
+                    onPressed: hasTrack
+                        ? () => unawaited(PlaybackController.previousTrack())
+                        : null,
+                    icon: const Icon(Icons.skip_previous_rounded),
+                    iconSize: 28,
+                  ),
+                  const SizedBox(width: 16),
+                  IconButton.filled(
+                    tooltip: hasTrack
+                        ? (playing ? 'Пауза' : 'Продолжить')
+                        : 'Запустить Мою волну',
+                    onPressed: () {
+                      if (hasTrack) {
+                        unawaited(PlaybackController.togglePlay());
+                      } else {
+                        unawaited(WaveController.startMyWave());
+                      }
+                    },
+                    style: IconButton.styleFrom(
+                      fixedSize: const Size(68, 68),
+                      backgroundColor: scheme.primary,
+                      foregroundColor: scheme.onPrimary,
+                    ),
+                    iconSize: 34,
+                    icon: Icon(
+                      hasTrack && playing
+                          ? Icons.pause_rounded
+                          : Icons.play_arrow_rounded,
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  IconButton.filledTonal(
+                    tooltip: 'Следующий трек',
+                    onPressed: hasTrack
+                        ? () => unawaited(PlaybackController.next())
+                        : null,
+                    icon: const Icon(Icons.skip_next_rounded),
+                    iconSize: 28,
+                  ),
+                ],
+              ),
+              if (hasTrack) ...[
+                const SizedBox(height: 12),
+                IconButton(
+                  tooltip: liked ? 'Убрать из любимого' : 'Добавить в любимое',
+                  onPressed: () {
+                    PlaybackController.toggleLike(trackId: trackId);
+                  },
+                  icon: Icon(
+                    liked
+                        ? Icons.favorite_rounded
+                        : Icons.favorite_border_rounded,
+                    color: liked ? Colors.pinkAccent : scheme.onSurfaceVariant,
+                    size: 24,
+                  ),
+                ),
+              ] else ...[
+                const SizedBox(height: 16),
+                FilledButton.icon(
+                  onPressed: () => unawaited(WaveController.startMyWave()),
+                  icon: const Icon(Icons.waves_rounded),
+                  label: const Text('Запустить Мою волну'),
+                ),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _WaveLiveBadge extends StatelessWidget {
+  final String label;
+  final bool active;
+
+  const _WaveLiveBadge({required this.label, required this.active});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final color = active ? scheme.primary : scheme.onSurfaceVariant;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(AppRadius.full),
+        border: Border.all(color: color.withValues(alpha: 0.22)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: color,
+            fontSize: 10,
+            fontWeight: FontWeight.w900,
+            letterSpacing: 0.8,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _WaveGlassSurface extends StatelessWidget {
+  final Widget child;
+  final EdgeInsets padding;
+
+  const _WaveGlassSurface({
+    required this.child,
+    this.padding = const EdgeInsets.all(16),
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final radius = BorderRadius.circular(AppRadius.xxl);
+    return ClipRRect(
+      borderRadius: radius,
+      child: BackdropFilter(
+        enabled: blurEffectsEnabledSignal.value,
+        filter: ui.ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHigh.withValues(alpha: 0.78),
+            borderRadius: radius,
+            border: Border.all(
+              color: scheme.onSurface.withValues(alpha: 0.09),
+            ),
+          ),
+          child: Padding(padding: padding, child: child),
+        ),
+      ),
+    );
+  }
+}
+
+class _WavePresetCard extends StatelessWidget {
+  final String title;
+  final String subtitle;
+  final IconData icon;
+  final String seed;
+  final bool selected;
+
+  const _WavePresetCard({
+    required this.title,
+    required this.subtitle,
+    required this.icon,
+    required this.seed,
+    required this.selected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(AppRadius.md),
+        onTap: () => unawaited(WaveController.toggleStation(seed)),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOutCubic,
+          constraints: const BoxConstraints(minHeight: 104),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 14),
+          decoration: BoxDecoration(
+            color: selected
+                ? scheme.primary.withValues(alpha: 0.14)
+                : scheme.surfaceContainerHigh.withValues(alpha: 0.62),
+            borderRadius: BorderRadius.circular(AppRadius.md),
+            border: Border.all(
+              color: selected
+                  ? scheme.primary.withValues(alpha: 0.58)
+                  : scheme.onSurface.withValues(alpha: 0.08),
+              width: selected ? 1.3 : 1,
+            ),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                color: selected ? scheme.primary : scheme.onSurfaceVariant,
+                size: 23,
+              ),
+              const SizedBox(height: 9),
+              Text(
+                title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: scheme.onSurface,
+                  fontWeight: FontWeight.w800,
+                  fontSize: 11,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                subtitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: scheme.onSurfaceVariant,
+                  fontSize: 10,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _WaveSettingsTile extends StatelessWidget {
+  final int activeFilters;
+  final VoidCallback onTap;
+
+  const _WaveSettingsTile({
+    required this.activeFilters,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return _WaveGlassSurface(
+      padding: EdgeInsets.zero,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(AppRadius.xxl),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color: scheme.primary.withValues(alpha: 0.14),
+                    borderRadius: BorderRadius.circular(AppRadius.md),
+                  ),
+                  child: Icon(Icons.tune_rounded, color: scheme.primary),
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Настроить Мою волну',
+                        style: TextStyle(
+                          color: scheme.onSurface,
+                          fontWeight: FontWeight.w800,
+                          fontSize: 14,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        activeFilters == 0
+                            ? 'Выбрать настроение, жанр и язык'
+                            : 'Активных параметров: ' + activeFilters.toString(),
+                        style: TextStyle(
+                          color: scheme.onSurfaceVariant,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  color: scheme.onSurfaceVariant,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class WaveSettingsPanel extends StatelessWidget {
