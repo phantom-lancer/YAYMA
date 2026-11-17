@@ -138,6 +138,9 @@ class _SettingsViewState extends State<SettingsView> {
     await runRustAction(
       (ctx) => simple.setVibeAnimationEnabled(ctx: ctx, enabled: enabled),
     );
+    if (Platform.isAndroid) {
+      await AndroidPlayerPreferences.setWaveVisibleOverride(enabled);
+    }
   }
 
   Future<void> _saveVibeRenderScale(double scale) async {
