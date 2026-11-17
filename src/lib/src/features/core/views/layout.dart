@@ -10,6 +10,7 @@ import 'package:yayma/src/features/artist/views/artist_view.dart';
 import 'package:yayma/src/features/auth/views/yandex_id_view.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
 import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
+import 'package:yayma/src/features/playback/views/android_wave_profiles.dart';
 import 'package:yayma/src/features/core/views/layout/background.dart';
 import 'package:yayma/src/features/core/views/layout/mobile_full_player.dart';
 import 'package:yayma/src/features/core/views/layout/navigation_bar.dart';
@@ -112,15 +113,13 @@ class _AppLayoutState extends State<AppLayout> {
     );
   }
 
-  /// Material gradient on Android, blurred cover elsewhere, plus the shader.
+  /// Shared artwork backdrop and the original PC shader on every platform.
+  /// Android used to replace this shader with a static gradient, which is why
+  /// its "My Wave" animation never matched the desktop implementation.
   List<Widget> _buildBackground() {
     return [
-      Positioned.fill(
-        child: Platform.isAndroid
-            ? const MaterialGradientBackground()
-            : const BlurredCoverBackground(),
-      ),
-      if (!Platform.isAndroid) const Positioned.fill(child: WaveBackground()),
+      const Positioned.fill(child: BlurredCoverBackground()),
+      const Positioned.fill(child: WaveBackground()),
     ];
   }
 
@@ -354,11 +353,12 @@ class _AnimatedPlayerBar extends StatelessWidget {
     return SignalBuilder(
       builder: (context) {
         final showLyrics = showLyricsSignal.value;
-        final isModernAndroidWave =
+        final profile = androidAppearanceProfileSignal.value;
+        final isCustomAndroidWave =
             Platform.isAndroid &&
             currentNavStateSignal.value.section == AppSection.wave &&
-            !classicAndroidPlayerSignal.value;
-        final shouldShowBar = (!isHome || showLyrics) && !isModernAndroidWave;
+            profile != AndroidAppearanceProfile.yayama;
+        final shouldShowBar = (!isHome || showLyrics) && !isCustomAndroidWave;
 
         return AnimatedSwitcher(
           duration: const Duration(milliseconds: 600),
@@ -403,7 +403,7 @@ class _WindowContent extends StatelessWidget {
     return SignalBuilder(
       builder: (context) {
         final isHome = state.section == AppSection.home;
-        classicAndroidPlayerSignal();
+        androidAppearanceProfileSignal();
         final showLyrics = showLyricsSignal.value;
         final screenWidth = MediaQuery.sizeOf(context).width;
         final isNarrow = Platform.isAndroid || screenWidth < 600;
@@ -478,15 +478,27 @@ class _WindowContent extends StatelessWidget {
           kind: parts.length > 1 ? parts[1] : null,
         );
       case AppSection.wave:
-        final useModernAndroidPlayer =
-            Platform.isAndroid && !classicAndroidPlayerSignal.value;
+        if (!Platform.isAndroid) return const MyWaveView();
+        final profile = androidAppearanceProfileSignal.value;
+        final Widget waveView = switch (profile) {
+          AndroidAppearanceProfile.yayama => const MyWaveView(
+            key: ValueKey('yayama_wave'),
+          ),
+          AndroidAppearanceProfile.yandexMusic => const YandexMusicWaveView(
+            key: ValueKey('yandex_wave'),
+          ),
+          AndroidAppearanceProfile.appleMusic => const AppleMusicWaveView(
+            key: ValueKey('apple_wave'),
+          ),
+          AndroidAppearanceProfile.current => const ModernMyWaveView(
+            key: ValueKey('current_wave'),
+          ),
+        };
         return AnimatedSwitcher(
           duration: const Duration(milliseconds: 420),
           switchInCurve: Curves.easeOutCubic,
           switchOutCurve: Curves.easeInCubic,
-          child: useModernAndroidPlayer
-              ? const ModernMyWaveView(key: ValueKey('modern_wave'))
-              : const MyWaveView(key: ValueKey('classic_wave')),
+          child: waveView,
         );
       case AppSection.account:
         return const SettingsView();
