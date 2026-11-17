@@ -130,6 +130,19 @@ class AppInit {
     unawaited(requestIgnoreBatteryOptimizations());
   }
 
+  static Future<void> _applyAndroidWavePreference(AppContext context) async {
+    if (!Platform.isAndroid) return;
+    final saved = AndroidPlayerPreferences.androidWaveVisibleOverrideSignal.value;
+    // Older Android previews always persisted false because the shader was
+    // unavailable. Enable it once on upgrade, then honor the user's choice.
+    final enabled = saved ?? true;
+    vibeVisibleSignal.value = enabled;
+    await simple.setVibeAnimationEnabled(ctx: context, enabled: enabled);
+    if (saved == null) {
+      await AndroidPlayerPreferences.setWaveVisibleOverride(enabled);
+    }
+  }
+
   static Future<void> _initializeAuthAndServices() async {
     final context = await tryAutoLogin();
     appContextSignal.value = context;
@@ -138,6 +151,8 @@ class AppInit {
       authSignal.value = const AsyncData(false);
       return;
     }
+
+    await _applyAndroidWavePreference(context);
 
     // Initialize playback locally before showing UI
     await initPlayback();
@@ -164,6 +179,7 @@ class AppInit {
       final context = await loginWithToken(token: token);
       appContextSignal.value = context;
 
+      await _applyAndroidWavePreference(context);
       await initPlayback();
 
       unawaited(_loadAccountInfo(context));
