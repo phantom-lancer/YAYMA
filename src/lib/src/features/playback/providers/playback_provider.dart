@@ -416,7 +416,6 @@ final FlutterComputed<Color> playerBarColorSignal = computed(
 
 // Sync palette with Rust for Vibe effect
 final EffectCleanup _vibePaletteEffect = effect(() {
-  if (Platform.isAndroid) return; // no wave shader on Android
   final scheme = colorSchemeSignal();
   final ctx = appContextSignal.value;
   if (scheme != null && ctx != null) {
