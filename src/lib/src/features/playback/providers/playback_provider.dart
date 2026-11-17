@@ -97,13 +97,8 @@ Future<void> _initPlaybackUnsafe() async {
   final ctx = appContextSignal.value;
   if (ctx == null) return;
 
-  // The Android UI has no wave shader, so keep Rust from computing ticks
-  // for a frame nobody draws.
-  if (Platform.isAndroid) {
-    vibeVisibleSignal.value = false;
-    unawaited(rust.setVibeAnimationEnabled(ctx: ctx, enabled: false));
-  }
-
+  // Android now renders the same full-screen FragmentShader as desktop.
+  // Keep the persisted wave setting intact instead of force-disabling ticks.
   await _eventSub?.cancel();
   _eventSub = null;
 
