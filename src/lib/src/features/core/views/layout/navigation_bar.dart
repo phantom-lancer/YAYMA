@@ -280,10 +280,14 @@ class _FloatingNavBarState extends State<FloatingNavBar>
                                     : null,
                             borderRadius: BorderRadius.circular(navRadius),
                             border: Border.all(
-                              color: Colors.white.withValues(
-                                alpha: isAppleGlass ? 0.20 : 0.10,
-                              ),
-                              width: isAppleGlass ? 0.9 : 0.7,
+                              color: isAppleGlass || isYandexStyle
+                                  ? Colors.white.withValues(
+                                      alpha: isAppleGlass ? 0.20 : 0.10,
+                                    )
+                                  : colorScheme.onSurface.withValues(
+                                      alpha: 0.1,
+                                    ),
+                              width: isAppleGlass ? 0.9 : 1.0,
                             ),
                           ),
                           child: isNarrow
