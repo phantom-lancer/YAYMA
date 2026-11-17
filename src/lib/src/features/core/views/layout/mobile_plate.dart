@@ -1,7 +1,10 @@
+import 'dart:io';
+
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/features/core/theme/app_theme.dart';
+import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
 import 'package:yayma/src/features/core/views/widgets/track_elements.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
@@ -53,13 +56,36 @@ class MiniPlateSurface {
   /// Background colour of the plate.
   Color get color => surfaceOverlay(colorScheme.surfaceContainerHighest);
 
-  /// Opacity of the plate background.
-  double get alpha => lyricsStyle ? 0.5 : 0.9;
+  AndroidAppearanceProfile get _profile => androidAppearanceProfileSignal.value;
 
-  /// Blur sigma of the plate backdrop.
-  double get blur => lyricsStyle ? 0.0 : 2.0;
+  /// Opacity follows the selected visual language without changing geometry.
+  double get alpha {
+    if (!Platform.isAndroid) return lyricsStyle ? 0.5 : 0.9;
+    return switch (_profile) {
+      AndroidAppearanceProfile.yayama => lyricsStyle ? 0.56 : 0.84,
+      AndroidAppearanceProfile.yandexMusic => 0.76,
+      AndroidAppearanceProfile.appleMusic => 0.34,
+      AndroidAppearanceProfile.current => 0.62,
+    };
+  }
 
-  Color get borderColor => colorScheme.onSurface.withValues(alpha: 0.08);
+  /// Stronger backdrop blur for the two glass-forward profiles.
+  double get blur {
+    if (!Platform.isAndroid) return lyricsStyle ? 0.0 : 2.0;
+    return switch (_profile) {
+      AndroidAppearanceProfile.yayama => lyricsStyle ? 0 : 12,
+      AndroidAppearanceProfile.yandexMusic => 18,
+      AndroidAppearanceProfile.appleMusic => 30,
+      AndroidAppearanceProfile.current => 20,
+    };
+  }
+
+  Color get borderColor => colorScheme.onSurface.withValues(
+    alpha: Platform.isAndroid &&
+            _profile == AndroidAppearanceProfile.appleMusic
+        ? 0.20
+        : 0.08,
+  );
 }
 
 /// Title and artist block of the mini plate.
