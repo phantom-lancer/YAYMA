@@ -8,6 +8,7 @@ import 'package:yayma/src/app/init.dart';
 import 'package:yayma/src/app/session.dart';
 import 'package:yayma/src/features/auth/views/yandex_id_view.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
+import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
@@ -84,6 +85,18 @@ class _FloatingNavBarState extends State<FloatingNavBar>
         final isDesktop =
             Platform.isWindows || Platform.isLinux || Platform.isMacOS;
         final barColor = playerBarColorSignal.value;
+        final appearance = androidAppearanceProfileSignal.value;
+        final isAppleGlass = Platform.isAndroid &&
+            appearance == AndroidAppearanceProfile.appleMusic;
+        final isYandexStyle = Platform.isAndroid &&
+            appearance == AndroidAppearanceProfile.yandexMusic;
+        final navRadius = isAppleGlass
+            ? 32.0
+            : isYandexStyle
+                ? 24.0
+                : AppRadius.xxxl;
+        final navAlpha = isAppleGlass ? 0.34 : isYandexStyle ? 0.72 : 0.5;
+        final navBlur = isAppleGlass ? 30.0 : isYandexStyle ? 20.0 : 16.0;
 
         final isVisible =
             !isHome ||
@@ -96,8 +109,6 @@ class _FloatingNavBarState extends State<FloatingNavBar>
         // so lift the floating navbar above the 3-button/gesture bar.
         // viewPadding stays stable when the keyboard opens.
         final systemBottom = MediaQuery.viewPaddingOf(context).bottom;
-
-        const alpha = 0.5;
 
         final children = [
           if (isDesktop)
@@ -219,30 +230,52 @@ class _FloatingNavBarState extends State<FloatingNavBar>
                   link: _layerLink,
                   child: Container(
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(AppRadius.xxxl),
+                      borderRadius: BorderRadius.circular(navRadius),
                     ),
                     child: ClipRRect(
-                      borderRadius: BorderRadius.circular(AppRadius.xxxl),
+                      borderRadius: BorderRadius.circular(navRadius),
                       child: BackdropFilter(
-                        enabled: blurEffectsEnabledSignal.value && !isHome,
+                        enabled: blurEffectsEnabledSignal.value,
                         filter: ui.ImageFilter.blur(
-                          sigmaX: isHome ? 0 : 2,
-                          sigmaY: isHome ? 0 : 2,
+                          sigmaX: navBlur,
+                          sigmaY: navBlur,
                         ),
                         child: Container(
-                          width: isNarrow ? null : 64,
+                          width: isNarrow
+                              ? MediaQuery.sizeOf(context).width - 48
+                              : 64,
                           height: isNarrow ? 64 : null,
                           padding: EdgeInsets.symmetric(
                             vertical: isNarrow ? 0 : 12,
                             horizontal: isNarrow ? 12 : 0,
                           ),
                           decoration: BoxDecoration(
-                            color: barColor.withValues(alpha: alpha),
-                            borderRadius: BorderRadius.circular(AppRadius.xxxl),
+                            color: barColor.withValues(alpha: navAlpha),
+                            gradient: isAppleGlass
+                                ? LinearGradient(
+                                    begin: Alignment.topCenter,
+                                    end: Alignment.bottomCenter,
+                                    colors: [
+                                      Colors.white.withValues(alpha: 0.15),
+                                      Colors.white.withValues(alpha: 0.035),
+                                    ],
+                                  )
+                                : isYandexStyle
+                                    ? const LinearGradient(
+                                        begin: Alignment.topLeft,
+                                        end: Alignment.bottomRight,
+                                        colors: [
+                                          Color(0x443C2226),
+                                          Color(0x22201D24),
+                                        ],
+                                      )
+                                    : null,
+                            borderRadius: BorderRadius.circular(navRadius),
                             border: Border.all(
-                              color: colorScheme.onSurface.withValues(
-                                alpha: 0.1,
+                              color: Colors.white.withValues(
+                                alpha: isAppleGlass ? 0.20 : 0.10,
                               ),
+                              width: isAppleGlass ? 0.9 : 0.7,
                             ),
                           ),
                           child: isNarrow
