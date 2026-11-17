@@ -403,6 +403,7 @@ class _WindowContent extends StatelessWidget {
     return SignalBuilder(
       builder: (context) {
         final isHome = state.section == AppSection.home;
+        classicAndroidPlayerSignal();
         final showLyrics = showLyricsSignal.value;
         final screenWidth = MediaQuery.sizeOf(context).width;
         final isNarrow = Platform.isAndroid || screenWidth < 600;
@@ -477,9 +478,16 @@ class _WindowContent extends StatelessWidget {
           kind: parts.length > 1 ? parts[1] : null,
         );
       case AppSection.wave:
-        return classicAndroidPlayerSignal.value
-            ? const MyWaveView()
-            : const ModernMyWaveView();
+        final useModernAndroidPlayer =
+            Platform.isAndroid && !classicAndroidPlayerSignal.value;
+        return AnimatedSwitcher(
+          duration: const Duration(milliseconds: 420),
+          switchInCurve: Curves.easeOutCubic,
+          switchOutCurve: Curves.easeInCubic,
+          child: useModernAndroidPlayer
+              ? const ModernMyWaveView(key: ValueKey('modern_wave'))
+              : const MyWaveView(key: ValueKey('classic_wave')),
+        );
       case AppSection.account:
         return const SettingsView();
       case AppSection.yandexId:
