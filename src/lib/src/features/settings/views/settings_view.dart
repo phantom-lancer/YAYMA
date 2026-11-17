@@ -9,6 +9,7 @@ import 'package:signals_flutter/signals_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:yayma/src/app/session.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
+import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/providers/notification_provider.dart';
 import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 import 'package:yayma/src/features/core/services/global_hotkey_service.dart';
@@ -273,6 +274,32 @@ class _SettingsViewState extends State<SettingsView> {
           );
         },
       ),
+      if (Platform.isAndroid) ...[
+        const SizedBox(height: 32),
+        const _SectionTitle(title: 'Внешний вид'),
+        const SizedBox(height: 20),
+        SignalBuilder(
+          builder: (context) {
+            final classic = classicAndroidPlayerSignal.value;
+            return _SettingItem(
+              title: 'Классический интерфейс плеера',
+              subtitle: classic
+                  ? 'Используется прежний экран "Моя волна"'
+                  : 'Выключено: используется новый интерфейс',
+              icon: Icons.album_rounded,
+              onTap: () => unawaited(
+                AndroidPlayerPreferences.setClassicPlayer(!classic),
+              ),
+              trailing: Switch(
+                value: classic,
+                onChanged: (value) => unawaited(
+                  AndroidPlayerPreferences.setClassicPlayer(value),
+                ),
+              ),
+            );
+          },
+        ),
+      ],
       const SizedBox(height: 32),
       const _SectionTitle(title: 'Визуальные эффекты'),
       const SizedBox(height: 20),
