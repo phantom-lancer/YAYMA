@@ -312,7 +312,6 @@ class _NowPlayingGlass extends StatelessWidget {
                   ),
                 ),
               const SizedBox(height: 12),
-              const SizedBox(height: 12),
               Text(
                 hasTrack ? title : 'Волна ждёт запуска',
                 textAlign: TextAlign.center,
