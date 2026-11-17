@@ -4,11 +4,13 @@ import 'dart:ui' as ui;
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
+import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 import 'package:yayma/src/features/core/views/widgets/app_cover.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
 import 'package:yayma/src/features/core/views/widgets/track_elements.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/features/playback/providers/wave_provider.dart';
+import 'package:yayma/src/rust/api/models.dart';
 import 'package:yayma/src/features/playback/views/wave_view.dart'
     show showWaveSettingsSheet;
 
@@ -28,11 +30,10 @@ class YandexMusicWaveView extends StatelessWidget {
         final seeds = currentWaveSeedsSignal();
         final scheme = Theme.of(context).colorScheme;
         final width = MediaQuery.sizeOf(context).width;
-        final contentWidth = (width - 40).clamp(280.0, 680.0);
         final duration = progress.durationMs;
         final position = progress.positionMs.clamp(0.0, duration).toDouble();
         final fraction = duration > 0
-            ? (position / duration).clamp(0.0, 1.0)
+            ? (position / duration).clamp(0.0, 1.0).toDouble()
             : 0.0;
 
         return SingleChildScrollView(
@@ -158,7 +159,7 @@ class _YandexNowPlaying extends StatelessWidget {
   final String? coverUrl;
   final String title;
   final String? version;
-  final List<dynamic> artists;
+  final List<TrackArtistDto> artists;
   final bool hasTrack;
   final bool playing;
   final bool liked;
@@ -183,7 +184,6 @@ class _YandexNowPlaying extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
     final narrow = MediaQuery.sizeOf(context).width < 420;
     final artSize = narrow ? 92.0 : 112.0;
 
@@ -251,7 +251,7 @@ class _YandexNowPlaying extends StatelessWidget {
                     const SizedBox(height: 5),
                     if (artists.isNotEmpty)
                       ArtistNamesWidget(
-                        artists: artists.cast(),
+                        artists: artists,
                         fontSize: 13,
                         color: Colors.white.withValues(alpha: 0.66),
                         maxLines: 1,
@@ -468,7 +468,7 @@ class AppleMusicWaveView extends StatelessWidget {
         final progress = trackProgressSignal();
         final scheme = Theme.of(context).colorScheme;
         final width = MediaQuery.sizeOf(context).width;
-        final artSize = (width - 72).clamp(190.0, 300.0);
+        final artSize = (width - 72).clamp(190.0, 300.0).toDouble();
         final duration = progress.durationMs;
         final position = progress.positionMs.clamp(0.0, duration).toDouble();
         final fraction = duration > 0
@@ -567,7 +567,7 @@ class AppleMusicWaveView extends StatelessWidget {
                               if (meta.id != null)
                                 _AppleGlassIcon(
                                   icon: liked
-                                      ? Icons.heart_fill_rounded
+                                      ? Icons.favorite_rounded
                                       : Icons.favorite_border_rounded,
                                   onPressed: () => unawaited(
                                     PlaybackController.toggleLike(
@@ -694,7 +694,7 @@ class AppleMusicWaveView extends StatelessWidget {
                   const SizedBox(height: 16),
                   TextButton.icon(
                     onPressed: () => showWaveSettingsSheet(context),
-                    icon: const Icon(Icons.slider_horizontal_3_rounded),
+                    icon: const Icon(Icons.tune_rounded),
                     label: const Text('Персонализация волны'),
                   ),
                 ],
@@ -719,6 +719,7 @@ class _AppleGlassPanel extends StatelessWidget {
     return ClipRRect(
       borderRadius: radius,
       child: BackdropFilter(
+        enabled: blurEffectsEnabledSignal.value,
         filter: ui.ImageFilter.blur(sigmaX: 28, sigmaY: 28),
         child: Container(
           decoration: BoxDecoration(
@@ -767,6 +768,7 @@ class _AppleGlassIcon extends StatelessWidget {
   Widget build(BuildContext context) {
     return ClipOval(
       child: BackdropFilter(
+        enabled: blurEffectsEnabledSignal.value,
         filter: ui.ImageFilter.blur(sigmaX: 20, sigmaY: 20),
         child: Material(
           color: Colors.white.withValues(alpha: 0.10),
@@ -796,6 +798,7 @@ class _ApplePlayButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return ClipOval(
       child: BackdropFilter(
+        enabled: blurEffectsEnabledSignal.value,
         filter: ui.ImageFilter.blur(sigmaX: 24, sigmaY: 24),
         child: Material(
           color: Colors.white.withValues(alpha: 0.17),
