@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:m3e_core/m3e_core.dart';
@@ -7,6 +8,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/features/core/services/app_error.dart';
 import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
+import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/theme/app_theme.dart';
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
 import 'package:yayma/src/features/core/views/widgets/app_context_menu.dart';
@@ -41,13 +43,22 @@ Future<T?> showAppBottomSheet<T>({
       if (!useLiquidGlass) return content;
 
       final scheme = Theme.of(sheetContext).colorScheme;
+      final profile = androidAppearanceProfileSignal.value;
+      final glassSigma = !Platform.isAndroid
+          ? 20.0
+          : switch (profile) {
+              AndroidAppearanceProfile.yayama => 20.0,
+              AndroidAppearanceProfile.yandexMusic => 24.0,
+              AndroidAppearanceProfile.appleMusic => 30.0,
+              AndroidAppearanceProfile.current => 26.0,
+            };
       return ClipRRect(
         borderRadius: const BorderRadius.vertical(
           top: Radius.circular(AppRadius.xxxl),
         ),
         child: BackdropFilter(
           enabled: blurEffectsEnabledSignal.value,
-          filter: ui.ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+          filter: ui.ImageFilter.blur(sigmaX: glassSigma, sigmaY: glassSigma),
           child: DecoratedBox(
             decoration: BoxDecoration(
               color: scheme.surfaceContainerHigh.withValues(alpha: 0.76),
