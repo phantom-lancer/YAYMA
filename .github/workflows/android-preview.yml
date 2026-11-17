@@ -37,7 +37,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
-          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
+          targets: aarch64-linux-android
 
       - name: Setup Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -102,22 +102,20 @@ jobs:
         run: |
           flutter config --no-analytics
           flutter pub get
-          flutter build apk --release --split-per-abi
+          flutter build apk --release --split-per-abi --target-platform android-arm64
 
-      - name: Collect APKs
+      - name: Collect ARM64 APK
         run: |
           mkdir -p android_artifacts
-          for apk in src/build/app/outputs/flutter-apk/app-*-release.apk; do
-            test -f "$apk"
-            abi=$(basename "$apk" | sed -E 's/app-(.*)-release\.apk/\1/')
-            cp "$apk" "android_artifacts/yayma-android-${abi}-preview${SIGN_SUFFIX}.apk"
-          done
+          apk=src/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          test -f "$apk"
+          cp "$apk" "android_artifacts/yayma-android-arm64-v8a-preview${SIGN_SUFFIX}.apk"
           ls -lh android_artifacts
 
       - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: yayma-android-preview
+          name: yayma-android-arm64-preview
           path: android_artifacts/*.apk
           if-no-files-found: error
           compression-level: 0
