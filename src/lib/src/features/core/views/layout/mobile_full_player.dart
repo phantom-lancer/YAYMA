@@ -10,6 +10,7 @@ import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
+import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
 import 'package:yayma/src/features/core/views/layout/mobile_cover_swipe.dart';
@@ -525,16 +526,20 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
         const Interval(0, 0.7, curve: Curves.easeOut).transform(panelT) * 0.5;
 
     final cs = Theme.of(context).colorScheme;
+    final isAppleGlass = Platform.isAndroid &&
+        androidAppearanceProfileSignal.value ==
+            AndroidAppearanceProfile.appleMusic;
     final baseColor = Color.lerp(
       cs.surfaceContainerHighest,
       Colors.black,
-      0.62,
+      isAppleGlass ? 0.34 : 0.62,
     )!;
     final topColor = Color.alphaBlend(
-      accent.withValues(alpha: 0.24),
+      accent.withValues(alpha: isAppleGlass ? 0.12 : 0.24),
       baseColor,
     );
     final bottomColor = Color.lerp(baseColor, Colors.black, 0.5)!;
+    final panelBackgroundAlpha = panelOpacity * (isAppleGlass ? 0.54 : 1.0);
 
     final miniAlpha = surface.alpha;
     final miniBlur = surface.blur;
@@ -577,6 +582,13 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
                       ),
                     ),
                   ),
+                if (isAppleGlass && panelT >= 0.98)
+                  Positioned.fill(
+                    child: BackdropFilter(
+                      filter: ui.ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                      child: const SizedBox.expand(),
+                    ),
+                  ),
                 Positioned.fill(
                   // Alpha lives in the gradient stops instead of an Opacity
                   // widget: same pixels, no full-screen saveLayer per frame.
@@ -586,9 +598,9 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
                         begin: Alignment.topCenter,
                         end: Alignment.bottomCenter,
                         colors: [
-                          topColor.withValues(alpha: panelOpacity),
-                          baseColor.withValues(alpha: panelOpacity),
-                          bottomColor.withValues(alpha: panelOpacity),
+                          topColor.withValues(alpha: panelBackgroundAlpha),
+                          baseColor.withValues(alpha: panelBackgroundAlpha),
+                          bottomColor.withValues(alpha: panelBackgroundAlpha),
                         ],
                         stops: const [0, 0.45, 1],
                       ),
