@@ -44,7 +44,8 @@ class ModernMyWaveView extends StatelessWidget {
             ? (position / duration).clamp(0.0, 1.0)
             : 0.0;
         final coverSize = (MediaQuery.sizeOf(context).width - horizontal * 2 - 56)
-            .clamp(160.0, 232.0);
+            .clamp(160.0, 232.0)
+            .toDouble();
 
         return Stack(
           children: [
