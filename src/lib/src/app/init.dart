@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/app/session.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
+import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 import 'package:yayma/src/features/library/providers/library_provider.dart';
 import 'package:yayma/src/features/playback/providers/audio_focus_manager.dart';
@@ -26,6 +27,7 @@ class AppInit {
     SignalsObserver.instance = null;
 
     await RustLib.init();
+    await AndroidPlayerPreferences.load();
 
     unawaited(UpdateService.cleanupDownloadedApk());
 
