@@ -1,5 +1,5 @@
 name: Android APK Preview
-# ARM64-only personal build; persistent keystore signing is required for in-place updates.
+# ARM64-only personal build; persistent keystore signing is required for in-place updates. Triggered from feature branch.
 
 on:
   push:
