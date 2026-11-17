@@ -113,13 +113,39 @@ class _AppLayoutState extends State<AppLayout> {
     );
   }
 
-  /// Shared artwork backdrop and the original PC shader on every platform.
-  /// Android used to replace this shader with a static gradient, which is why
-  /// its "My Wave" animation never matched the desktop implementation.
+  /// Each Android appearance gets its own background language:
+  /// YAYAMA keeps its original gradient, Apple uses artwork blur + glass,
+  /// while Yandex and the saved current design use the original PC shader.
   List<Widget> _buildBackground() {
+    if (!Platform.isAndroid) {
+      return const [
+        Positioned.fill(child: BlurredCoverBackground()),
+        Positioned.fill(child: WaveBackground()),
+      ];
+    }
+
     return [
-      const Positioned.fill(child: BlurredCoverBackground()),
-      const Positioned.fill(child: WaveBackground()),
+      Positioned.fill(
+        child: SignalBuilder(
+          builder: (context) {
+            final profile = androidAppearanceProfileSignal.value;
+            return profile == AndroidAppearanceProfile.yayama
+                ? const MaterialGradientBackground()
+                : const BlurredCoverBackground();
+          },
+        ),
+      ),
+      Positioned.fill(
+        child: SignalBuilder(
+          builder: (context) {
+            final profile = androidAppearanceProfileSignal.value;
+            final showShader =
+                profile == AndroidAppearanceProfile.yandexMusic ||
+                profile == AndroidAppearanceProfile.current;
+            return showShader ? const WaveBackground() : const SizedBox.shrink();
+          },
+        ),
+      ),
     ];
   }
 
