@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:ui' as ui;
 
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
@@ -26,15 +25,9 @@ class YandexMusicWaveView extends StatelessWidget {
         final meta = trackMetadataSignal();
         final playing = stablePlayingSignal();
         final liked = isLikedSignal();
-        final progress = trackProgressSignal();
         final seeds = currentWaveSeedsSignal();
         final scheme = Theme.of(context).colorScheme;
         final width = MediaQuery.sizeOf(context).width;
-        final duration = progress.durationMs;
-        final position = progress.positionMs.clamp(0.0, duration).toDouble();
-        final fraction = duration > 0
-            ? (position / duration).clamp(0.0, 1.0).toDouble()
-            : 0.0;
 
         return SingleChildScrollView(
           physics: const BouncingScrollPhysics(),
@@ -91,9 +84,6 @@ class YandexMusicWaveView extends StatelessWidget {
                     playing: playing,
                     liked: liked,
                     trackId: meta.id,
-                    position: position,
-                    duration: duration,
-                    fraction: fraction,
                   ),
                   const SizedBox(height: 26),
                   Row(
@@ -164,9 +154,6 @@ class _YandexNowPlaying extends StatelessWidget {
   final bool playing;
   final bool liked;
   final String? trackId;
-  final double position;
-  final double duration;
-  final double fraction;
 
   const _YandexNowPlaying({
     required this.coverUrl,
@@ -177,9 +164,6 @@ class _YandexNowPlaying extends StatelessWidget {
     required this.playing,
     required this.liked,
     required this.trackId,
-    required this.position,
-    required this.duration,
-    required this.fraction,
   });
 
   @override
@@ -280,37 +264,10 @@ class _YandexNowPlaying extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 14),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: LinearProgressIndicator(
-              value: fraction,
-              minHeight: 3,
-              backgroundColor: Colors.white.withValues(alpha: 0.16),
-              valueColor: const AlwaysStoppedAnimation(Color(0xFFFF656B)),
-            ),
-          ),
-          const SizedBox(height: 6),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(
-                formatDuration(position.round()),
-                style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.54),
-                  fontSize: 10,
-                  fontFeatures: const [ui.FontFeature.tabularFigures()],
-                ),
-              ),
-              Text(
-                formatDuration(duration.round()),
-                style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.54),
-                  fontSize: 10,
-                  fontFeatures: const [ui.FontFeature.tabularFigures()],
-                ),
-              ),
-            ],
-          ),
+          if (hasTrack) ...[
+            const SizedBox(height: 14),
+            const CommonProgressSlider(compact: true),
+          ],
           const SizedBox(height: 5),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -465,15 +422,9 @@ class AppleMusicWaveView extends StatelessWidget {
         final meta = trackMetadataSignal();
         final playing = stablePlayingSignal();
         final liked = isLikedSignal();
-        final progress = trackProgressSignal();
         final scheme = Theme.of(context).colorScheme;
         final width = MediaQuery.sizeOf(context).width;
         final artSize = (width - 72).clamp(190.0, 300.0).toDouble();
-        final duration = progress.durationMs;
-        final position = progress.positionMs.clamp(0.0, duration).toDouble();
-        final fraction = duration > 0
-            ? (position / duration).clamp(0.0, 1.0)
-            : 0.0;
 
         return SingleChildScrollView(
           physics: const BouncingScrollPhysics(),
@@ -579,43 +530,10 @@ class AppleMusicWaveView extends StatelessWidget {
                             ],
                           ),
                           const SizedBox(height: 18),
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(10),
-                            child: LinearProgressIndicator(
-                              value: fraction,
-                              minHeight: 4,
-                              backgroundColor:
-                                  scheme.onSurface.withValues(alpha: 0.10),
-                              valueColor:
-                                  AlwaysStoppedAnimation<Color>(scheme.primary),
-                            ),
-                          ),
-                          const SizedBox(height: 7),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Text(
-                                formatDuration(position.round()),
-                                style: Theme.of(context).textTheme.labelSmall
-                                    ?.copyWith(
-                                      color: scheme.onSurfaceVariant,
-                                      fontFeatures: const [
-                                        ui.FontFeature.tabularFigures(),
-                                      ],
-                                    ),
-                              ),
-                              Text(
-                                formatDuration(duration.round()),
-                                style: Theme.of(context).textTheme.labelSmall
-                                    ?.copyWith(
-                                      color: scheme.onSurfaceVariant,
-                                      fontFeatures: const [
-                                        ui.FontFeature.tabularFigures(),
-                                      ],
-                                    ),
-                              ),
-                            ],
-                          ),
+                          if (meta.id != null) ...[
+                            const SizedBox(height: 18),
+                            const CommonProgressSlider(),
+                          ],
                           const SizedBox(height: 6),
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
