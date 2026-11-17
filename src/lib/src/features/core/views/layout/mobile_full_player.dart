@@ -582,7 +582,9 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
                       ),
                     ),
                   ),
-                if (isAppleGlass && panelT >= 0.98)
+                if (isAppleGlass &&
+                    blurEffectsEnabledSignal.value &&
+                    panelT >= 0.98)
                   Positioned.fill(
                     child: BackdropFilter(
                       filter: ui.ImageFilter.blur(sigmaX: 18, sigmaY: 18),
