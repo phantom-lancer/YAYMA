@@ -324,51 +324,51 @@ class _SettingsViewState extends State<SettingsView> {
       const SizedBox(height: 20),
       // The shared PC shader is available on Android as well.
       SignalBuilder(
-          builder: (context) {
-            final enabled = vibeVisibleSignal.value;
-            return _SettingItem(
-              title: 'Показывать анимацию волны',
-              subtitle: 'Динамический фон, реагирующий на музыку',
-              icon: Icons.waves_rounded,
-              onTap: () => unawaited(_toggleVibeVisibility(!enabled)),
-              trailing: Switch(
-                value: enabled,
-                onChanged: (value) => unawaited(_toggleVibeVisibility(value)),
+        builder: (context) {
+          final enabled = vibeVisibleSignal.value;
+          return _SettingItem(
+            title: 'Показывать анимацию волны',
+            subtitle: 'Анимация из ПК-версии в стилях Yandex и текущем',
+            icon: Icons.waves_rounded,
+            onTap: () => unawaited(_toggleVibeVisibility(!enabled)),
+            trailing: Switch(
+              value: enabled,
+              onChanged: (value) => unawaited(_toggleVibeVisibility(value)),
+            ),
+          );
+        },
+      ),
+      const SizedBox(height: 8),
+      SignalBuilder(
+        builder: (context) {
+          final scale = vibeRenderScaleSignal.value;
+          return _SettingItem(
+            title: 'Разрешение волны',
+            subtitle:
+                '${(scale * 100).round()}% — выше качество, выше нагрузка',
+            icon: Icons.high_quality_rounded,
+            onTap: () {},
+            trailing: SizedBox(
+              width: isNarrow ? 120 : 200,
+              child: M3ESlider(
+                value: scale,
+                min: minVibeRenderScale,
+                max: maxVibeRenderScale,
+                divisions: 5,
+                label: '${(scale * 100).round()}%',
+                onChanged: vibeVisibleSignal.value
+                    ? (value) {
+                        vibeRenderScaleSignal.value = value;
+                      }
+                    : null,
+                onChangeEnd: (value) =>
+                    unawaited(_saveVibeRenderScale(value)),
               ),
-            );
-          },
-        ),
-        const SizedBox(height: 8),
-        SignalBuilder(
-          builder: (context) {
-            final scale = vibeRenderScaleSignal.value;
-            return _SettingItem(
-              title: 'Разрешение волны',
-              subtitle:
-                  '${(scale * 100).round()}% — выше качество, выше нагрузка',
-              icon: Icons.high_quality_rounded,
-              onTap: () {},
-              trailing: SizedBox(
-                width: isNarrow ? 120 : 200,
-                child: M3ESlider(
-                  value: scale,
-                  min: minVibeRenderScale,
-                  max: maxVibeRenderScale,
-                  divisions: 5,
-                  label: '${(scale * 100).round()}%',
-                  onChanged: vibeVisibleSignal.value
-                      ? (value) {
-                          vibeRenderScaleSignal.value = value;
-                        }
-                      : null,
-                  onChangeEnd: (value) =>
-                      unawaited(_saveVibeRenderScale(value)),
-                ),
-              ),
-            );
-          },
-        ),
-        const SizedBox(height: 8),
+            ),
+          );
+        },
+      ),
+      const SizedBox(height: 8),
       SignalBuilder(
         builder: (context) {
           final enabled = blurEffectsEnabledSignal.value;
