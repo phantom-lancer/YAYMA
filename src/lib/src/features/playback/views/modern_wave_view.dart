@@ -672,17 +672,31 @@ class _WaveEnergyVisualizer extends StatefulWidget {
   State<_WaveEnergyVisualizer> createState() => _WaveEnergyVisualizerState();
 }
 
-class _WaveEnergyVisualizerState extends State<_WaveEnergyVisualizer> {
+class _WaveEnergyVisualizerState extends State<_WaveEnergyVisualizer>
+    with WidgetsBindingObserver {
+  bool _appResumed = true;
+
+  bool get _shouldRun => widget.active && _appResumed;
   @override
   void initState() {
     super.initState();
-    _setActive(widget.active);
+    WidgetsBinding.instance.addObserver(this);
+    _appResumed = WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+    _setActive(_shouldRun);
   }
 
   @override
   void didUpdateWidget(_WaveEnergyVisualizer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.active != widget.active) _setActive(widget.active);
+    if (oldWidget.active != widget.active) _setActive(_shouldRun);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final resumed = state == AppLifecycleState.resumed;
+    if (_appResumed == resumed) return;
+    _appResumed = resumed;
+    _setActive(_shouldRun);
   }
 
   void _setActive(bool active) {
@@ -699,13 +713,14 @@ class _WaveEnergyVisualizerState extends State<_WaveEnergyVisualizer> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _setActive(false);
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!widget.active) return const SizedBox(height: 46);
+    if (!_shouldRun) return const SizedBox(height: 46);
     return SizedBox(
       height: 46,
       width: double.infinity,
