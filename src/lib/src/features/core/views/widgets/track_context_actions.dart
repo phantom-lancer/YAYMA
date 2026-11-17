@@ -249,7 +249,7 @@ class TrackContextActions {
         await PlaybackController.playTrackNext(trackId);
         showAppSuccess('Трек добавлен следующим');
       case 'sleep_timer':
-        await showSleepTimerSheet(context, trackId: trackId);
+        await showSleepTimerSheet(context);
       case 'copy_link':
         final link = albumId != null
             ? 'https://music.yandex.ru/album/$albumId/track/$trackId'
