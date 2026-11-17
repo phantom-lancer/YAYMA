@@ -286,23 +286,31 @@ class _SettingsViewState extends State<SettingsView> {
               subtitle: '${profile.title} - ${profile.description}',
               icon: Icons.palette_outlined,
               onTap: () {},
-              trailing: DropdownButton<AndroidAppearanceProfile>(
-                value: profile,
-                underline: const SizedBox.shrink(),
-                borderRadius: BorderRadius.circular(18),
-                onChanged: (value) {
-                  if (value != null) {
-                    unawaited(AndroidPlayerPreferences.setProfile(value));
-                  }
-                },
-                items: AndroidAppearanceProfile.values
-                    .map(
-                      (option) => DropdownMenuItem<AndroidAppearanceProfile>(
-                        value: option,
-                        child: Text(option.title, maxLines: 1),
-                      ),
-                    )
-                    .toList(),
+              trailing: SizedBox(
+                width: isNarrow ? 148 : 220,
+                child: DropdownButton<AndroidAppearanceProfile>(
+                  isExpanded: true,
+                  value: profile,
+                  underline: const SizedBox.shrink(),
+                  borderRadius: BorderRadius.circular(18),
+                  onChanged: (value) {
+                    if (value != null) {
+                      unawaited(AndroidPlayerPreferences.setProfile(value));
+                    }
+                  },
+                  items: AndroidAppearanceProfile.values
+                      .map(
+                        (option) => DropdownMenuItem<AndroidAppearanceProfile>(
+                          value: option,
+                          child: Text(
+                            option.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      )
+                      .toList(),
+                ),
               ),
             );
           },
