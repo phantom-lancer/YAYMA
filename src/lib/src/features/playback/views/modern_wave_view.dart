@@ -1,22 +1,17 @@
 import 'dart:async';
 import 'dart:ui' as ui;
-import 'dart:math' as math;
 
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
-import 'package:yayma/src/app/session.dart';
 import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
 import 'package:yayma/src/features/core/views/widgets/app_cover.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
 import 'package:yayma/src/features/core/views/widgets/responsive.dart';
-import 'package:yayma/src/features/core/views/widgets/tab_visibility.dart';
 import 'package:yayma/src/features/core/views/widgets/track_elements.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/features/playback/providers/wave_provider.dart';
 import 'package:yayma/src/rust/api/models.dart';
-import 'package:yayma/src/rust/api/simple.dart' as rust_simple;
-import 'package:yayma/src/rust/lib.dart';
 import 'package:yayma/src/features/playback/views/wave_view.dart'
     show showWaveSettingsSheet;
 
@@ -34,7 +29,6 @@ class ModernMyWaveView extends StatelessWidget {
         final progress = trackProgressSignal();
         final buffering = showBufferingIndicatorSignal();
         final liked = isLikedSignal();
-        final vibeActive = TabVisibility.of(context) && playing;
         final scheme = Theme.of(context).colorScheme;
         final horizontal = context.horizontalPadding;
         final hasTrack = meta.id != null;
@@ -132,7 +126,6 @@ class ModernMyWaveView extends StatelessWidget {
                               fraction: fraction,
                               position: position,
                               duration: duration,
-                              vibeActive: vibeActive,
                             ),
                             const SizedBox(height: 24),
                             Row(
@@ -223,7 +216,6 @@ class _NowPlayingGlass extends StatelessWidget {
   final double fraction;
   final double position;
   final double duration;
-  final bool vibeActive;
 
   const _NowPlayingGlass({
     required this.coverSize,
@@ -239,7 +231,6 @@ class _NowPlayingGlass extends StatelessWidget {
     required this.fraction,
     required this.position,
     required this.duration,
-    required this.vibeActive,
   });
 
   @override
@@ -321,11 +312,6 @@ class _NowPlayingGlass extends StatelessWidget {
                   ),
                 ),
               const SizedBox(height: 12),
-              _WaveEnergyVisualizer(
-                active: vibeActive,
-                primary: scheme.primary,
-                secondary: scheme.tertiary,
-              ),
               const SizedBox(height: 12),
               Text(
                 hasTrack ? title : 'Волна ждёт запуска',
@@ -652,153 +638,4 @@ class _StatusPill extends StatelessWidget {
       ),
     );
   }
-}
-
-
-/// Reuses Rust's live audio-energy ticks. Android only enables the producer
-/// while this screen is visible and playback is active.
-class _WaveEnergyVisualizer extends StatefulWidget {
-  final bool active;
-  final Color primary;
-  final Color secondary;
-
-  const _WaveEnergyVisualizer({
-    required this.active,
-    required this.primary,
-    required this.secondary,
-  });
-
-  @override
-  State<_WaveEnergyVisualizer> createState() => _WaveEnergyVisualizerState();
-}
-
-class _WaveEnergyVisualizerState extends State<_WaveEnergyVisualizer>
-    with WidgetsBindingObserver {
-  bool _appResumed = true;
-
-  bool get _shouldRun => widget.active && _appResumed;
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    _appResumed = WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
-    _setActive(_shouldRun);
-  }
-
-  @override
-  void didUpdateWidget(_WaveEnergyVisualizer oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.active != widget.active) _setActive(_shouldRun);
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    final resumed = state == AppLifecycleState.resumed;
-    if (_appResumed == resumed) return;
-    _appResumed = resumed;
-    _setActive(_shouldRun);
-  }
-
-  void _setActive(bool active) {
-    vibeVisibleSignal.value = active;
-    final ctx = appContextSignal.value;
-    if (ctx != null) {
-      unawaited(
-        rust_simple
-            .setVibeAnimationEnabled(ctx: ctx, enabled: active)
-            .catchError((_) {}),
-      );
-    }
-  }
-
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _setActive(false);
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (!_shouldRun) return const SizedBox(height: 46);
-    return SizedBox(
-      height: 46,
-      width: double.infinity,
-      child: RepaintBoundary(
-        child: CustomPaint(
-          painter: _WaveEnergyPainter(
-            signal: vibeTickSignal,
-            primary: widget.primary,
-            secondary: widget.secondary,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _WaveEnergyPainter extends CustomPainter {
-  final FlutterSignal<F32Array26> signal;
-  final Color primary;
-  final Color secondary;
-
-  _WaveEnergyPainter({
-    required this.signal,
-    required this.primary,
-    required this.secondary,
-  }) : super(repaint: signal);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final values = signal.value;
-    if (values.length < 8) return;
-
-    final time = values[0];
-    final bass = values[2].clamp(0.0, 1.0).toDouble();
-    final mids = values[3].clamp(0.0, 1.0).toDouble();
-    final highs = values[4].clamp(0.0, 1.0).toDouble();
-    final bassReact = values[5].clamp(0.0, 1.0).toDouble();
-    final midReact = values[6].clamp(0.0, 1.0).toDouble();
-    final highReact = values[7].clamp(0.0, 1.0).toDouble();
-
-    final bands = [
-      (primary, bass, bassReact, 1.0),
-      (secondary, mids, midReact, 1.65),
-      (primary, highs, highReact, 2.25),
-    ];
-    final centerY = size.height / 2;
-    final width = size.width;
-
-    for (var band = 0; band < bands.length; band++) {
-      final (color, energy, reaction, frequency) = bands[band];
-      final amplitude = 3.5 + energy * 9 + reaction * 8;
-      final path = Path();
-      const segments = 72;
-      for (var i = 0; i <= segments; i++) {
-        final x = width * i / segments;
-        final phase = i / segments * math.pi * 2 * frequency;
-        final envelope = 0.35 +
-            0.65 * math.sin(math.pi * i / segments).abs();
-        final y = centerY +
-            math.sin(phase + time * (1.2 + band * 0.28)) *
-                amplitude *
-                envelope;
-        if (i == 0) {
-          path.moveTo(x, y);
-        } else {
-          path.lineTo(x, y);
-        }
-      }
-      final paint = Paint()
-        ..color = color.withValues(alpha: 0.42 + energy * 0.42)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.8 + reaction * 0.8
-        ..strokeCap = StrokeCap.round;
-      canvas.drawPath(path, paint);
-    }
-  }
-
-  @override
-  bool shouldRepaint(_WaveEnergyPainter oldDelegate) =>
-      oldDelegate.primary != primary || oldDelegate.secondary != secondary;
 }
