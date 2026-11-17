@@ -15,7 +15,7 @@ import 'package:yayma/src/features/core/views/widgets/track_elements.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/features/playback/providers/wave_provider.dart';
 import 'package:yayma/src/rust/api/models.dart';
-import 'package:yayma/src/rust/api/audio_fx.dart' as rust_audio;
+import 'package:yayma/src/rust/api/simple.dart' as rust_simple;
 import 'package:yayma/src/rust/lib.dart';
 import 'package:yayma/src/features/playback/views/wave_view.dart'
     show showWaveSettingsSheet;
@@ -704,7 +704,7 @@ class _WaveEnergyVisualizerState extends State<_WaveEnergyVisualizer>
     final ctx = appContextSignal.value;
     if (ctx != null) {
       unawaited(
-        rust_audio
+        rust_simple
             .setVibeAnimationEnabled(ctx: ctx, enabled: active)
             .catchError((_) {}),
       );
