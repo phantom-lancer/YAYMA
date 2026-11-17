@@ -46,6 +46,7 @@ pub struct InitialSettingsDto {
     pub vibe_animation_enabled: bool,
     pub vibe_render_scale: f64,
     pub blur_effects_enabled: bool,
+    pub liquid_glass_v2_enabled: bool,
 }
 
 impl Default for InitialSettingsDto {
@@ -57,6 +58,7 @@ impl Default for InitialSettingsDto {
             vibe_animation_enabled: true,
             vibe_render_scale: 0.50,
             blur_effects_enabled: true,
+            liquid_glass_v2_enabled: true,
         }
     }
 }

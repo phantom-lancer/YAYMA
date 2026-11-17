@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/features/core/services/app_error.dart';
+import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 import 'package:yayma/src/features/core/theme/app_theme.dart';
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
 import 'package:yayma/src/features/core/views/widgets/app_context_menu.dart';
@@ -25,13 +27,55 @@ Future<T?> showAppBottomSheet<T>({
   Color? backgroundColor,
 }) {
   final cs = Theme.of(context).colorScheme;
+  final useLiquidGlass =
+      liquidGlassV2EnabledSignal.value && backgroundColor == null;
   return showM3EModalBottomSheet<T>(
     context: context,
     showDragHandle: showDragHandle,
-    backgroundColor:
-        backgroundColor ?? surfaceOverlay(cs.surfaceContainerHighest),
+    backgroundColor: useLiquidGlass
+        ? Colors.transparent
+        : backgroundColor ?? surfaceOverlay(cs.surfaceContainerHighest),
     style: const M3EBottomSheetStyle(padding: EdgeInsets.zero),
-    builder: builder,
+    builder: (sheetContext) {
+      final content = builder(sheetContext);
+      if (!useLiquidGlass) return content;
+
+      final scheme = Theme.of(sheetContext).colorScheme;
+      return ClipRRect(
+        borderRadius: const BorderRadius.vertical(
+          top: Radius.circular(AppRadius.xxxl),
+        ),
+        child: BackdropFilter(
+          enabled: blurEffectsEnabledSignal.value,
+          filter: ui.ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHigh.withValues(alpha: 0.76),
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  scheme.surfaceContainerHigh.withValues(alpha: 0.80),
+                  scheme.surfaceContainer.withValues(alpha: 0.92),
+                ],
+              ),
+              border: Border(
+                top: BorderSide(
+                  color: scheme.onSurface.withValues(alpha: 0.18),
+                ),
+                left: BorderSide(
+                  color: scheme.onSurface.withValues(alpha: 0.08),
+                ),
+                right: BorderSide(
+                  color: scheme.onSurface.withValues(alpha: 0.08),
+                ),
+              ),
+            ),
+            child: content,
+          ),
+        ),
+      );
+    },
   );
 }
 

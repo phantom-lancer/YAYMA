@@ -132,6 +132,15 @@ pub async fn play_track(ctx: &AppContext, track_id: String) {
     }
 }
 
+/// Inserts a fetched track immediately after the currently playing track.
+pub async fn play_track_next(ctx: &AppContext, track_id: String) {
+    if let Ok(tracks) = ctx.core.api.fetch_tracks(vec![track_id]).await
+        && let Some(track) = tracks.into_iter().next()
+    {
+        let _ = ctx.audio.tx.send(AudioMessage::PlayTrackNext(track)).await;
+    }
+}
+
 pub async fn restore_and_play(
     ctx: &AppContext,
     track_id: String,

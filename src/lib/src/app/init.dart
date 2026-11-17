@@ -44,6 +44,7 @@ class AppInit {
       vibeVisibleSignal.value = settings.vibeAnimationEnabled;
       vibeRenderScaleSignal.value = settings.vibeRenderScale;
       blurEffectsEnabledSignal.value = settings.blurEffectsEnabled;
+      liquidGlassV2EnabledSignal.value = settings.liquidGlassV2Enabled;
     } on Object catch (_) {}
 
     unawaited(_initializeAuthAndServices());

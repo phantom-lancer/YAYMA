@@ -83,6 +83,8 @@ pub async fn get_initial_settings() -> InitialSettingsDto {
             .unwrap_or(0.50)
             .clamp(0.25, 0.50),
         blur_effects_enabled: parse_setting(&settings, "blur_effects_enabled").unwrap_or(true),
+        liquid_glass_v2_enabled: parse_setting(&settings, "liquid_glass_v2_enabled")
+            .unwrap_or(true),
     }
 }
 
@@ -251,5 +253,16 @@ pub async fn set_blur_effects_enabled(ctx: &AppContext, enabled: bool) {
         .lock()
         .await
         .save_setting("blur_effects_enabled", &enabled)
+        .await;
+}
+
+
+pub async fn set_liquid_glass_v2_enabled(ctx: &AppContext, enabled: bool) {
+    let _ = ctx
+        .core
+        .db
+        .lock()
+        .await
+        .save_setting("liquid_glass_v2_enabled", &enabled)
         .await;
 }

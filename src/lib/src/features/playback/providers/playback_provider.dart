@@ -502,6 +502,8 @@ Future<void> refreshAudioEffects() async {
 class PlaybackController {
   static Future<void> playTrack(String trackId) =>
       runRustAction((ctx) => rust.playTrack(ctx: ctx, trackId: trackId));
+  static Future<void> playTrackNext(String trackId) =>
+      runRustAction((ctx) => rust.playTrackNext(ctx: ctx, trackId: trackId));
   static Future<void> playLikedTrack(String trackId) =>
       runRustAction((ctx) => rust.playLikedTrack(ctx: ctx, trackId: trackId));
   static Future<void> playAlbumTrack(int albumId, String trackId) =>

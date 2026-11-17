@@ -154,6 +154,13 @@ class _SettingsViewState extends State<SettingsView> {
     );
   }
 
+  Future<void> _toggleLiquidGlassV2(bool enabled) async {
+    liquidGlassV2EnabledSignal.value = enabled;
+    await runRustAction(
+      (ctx) => simple.setLiquidGlassV2Enabled(ctx: ctx, enabled: enabled),
+    );
+  }
+
   Future<void> _pickPath() async {
     final result = await FilePicker.getDirectoryPath();
     if (result == null) return;
@@ -329,6 +336,23 @@ class _SettingsViewState extends State<SettingsView> {
             trailing: Switch(
               value: enabled,
               onChanged: (value) => unawaited(_toggleBlurEffects(value)),
+            ),
+          );
+        },
+      ),
+      const SizedBox(height: 8),
+      SignalBuilder(
+        builder: (context) {
+          final enabled = liquidGlassV2EnabledSignal.value;
+          return _SettingItem(
+            title: 'Liquid Glass v2',
+            subtitle:
+                'Многослойное стекло, блики и глубокое размытие в меню и уведомлениях',
+            icon: Icons.blur_circular_rounded,
+            onTap: () => unawaited(_toggleLiquidGlassV2(!enabled)),
+            trailing: Switch(
+              value: enabled,
+              onChanged: (value) => unawaited(_toggleLiquidGlassV2(value)),
             ),
           );
         },

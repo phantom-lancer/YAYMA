@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
+import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 
 enum AppNotificationLevel { error, warning, success }
 
@@ -167,16 +169,29 @@ class _GlobalNotificationListenerState extends State<GlobalNotificationListener>
                               cs.onPrimary,
                             ),
                           };
-                          return Container(
+                          final glass = liquidGlassV2EnabledSignal.value;
+                          final glassColor = Color.alphaBlend(
+                            bgColor.withValues(alpha: 0.28),
+                            cs.surfaceContainerHigh.withValues(alpha: 0.90),
+                          );
+                          final foreground = glass ? cs.onSurface : fgColor;
+                          return ClipRRect(
+                            borderRadius: BorderRadius.circular(100),
+                            child: BackdropFilter(
+                              enabled: glass && blurEffectsEnabledSignal.value,
+                              filter: ui.ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                              child: Container(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 24,
                               vertical: 12,
                             ),
                             decoration: BoxDecoration(
-                              color: bgColor,
+                              color: glass ? glassColor : bgColor,
                               borderRadius: BorderRadius.circular(100),
                               border: Border.all(
-                                color: cs.onSurface.withValues(alpha: 0.1),
+                                color: glass
+                                    ? bgColor.withValues(alpha: 0.48)
+                                    : cs.onSurface.withValues(alpha: 0.1),
                               ),
                               boxShadow: const [
                                 BoxShadow(
@@ -198,7 +213,7 @@ class _GlobalNotificationListenerState extends State<GlobalNotificationListener>
                                     AppNotificationLevel.success =>
                                       Icons.check_circle_outline_rounded,
                                   },
-                                  color: fgColor,
+                                  color: foreground,
                                   size: 20,
                                 ),
                                 const SizedBox(width: 12),
@@ -206,13 +221,15 @@ class _GlobalNotificationListenerState extends State<GlobalNotificationListener>
                                   child: Text(
                                     _currentNotification!.message,
                                     style: TextStyle(
-                                      color: fgColor,
+                                      color: foreground,
                                       fontWeight: FontWeight.w600,
                                       fontSize: 14,
                                     ),
                                   ),
                                 ),
                               ],
+                            ),
+                          ),
                             ),
                           );
                         },

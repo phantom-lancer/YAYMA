@@ -21,6 +21,7 @@ import 'package:yayma/src/features/core/views/widgets/rust_cached_image.dart';
 import 'package:yayma/src/features/core/views/widgets/track_context_actions.dart';
 import 'package:yayma/src/features/core/views/widgets/track_elements.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
+import 'package:yayma/src/features/playback/views/sleep_timer_sheet.dart';
 import 'package:yayma/src/features/playback/views/wave_view.dart';
 import 'package:yayma/src/rust/api/models.dart';
 
@@ -1680,6 +1681,7 @@ class _FullPlayerControls extends StatelessWidget {
                 ),
               ),
             ),
+            const SleepTimerIconButton(),
           ],
         );
       },

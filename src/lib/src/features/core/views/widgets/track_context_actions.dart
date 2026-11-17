@@ -15,6 +15,7 @@ import 'package:yayma/src/features/core/views/widgets/download_menu.dart';
 import 'package:yayma/src/features/core/views/widgets/lyrics_view.dart';
 import 'package:yayma/src/features/core/views/widgets/track_context_sheet.dart';
 import 'package:yayma/src/features/core/views/widgets/track_details_dialog.dart';
+import 'package:yayma/src/features/playback/views/sleep_timer_sheet.dart';
 import 'package:yayma/src/features/library/providers/library_provider.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/rust/api/content.dart' as rust;
@@ -153,6 +154,16 @@ class TrackContextActions {
         ];
       },
       actions: [
+        const TrackSheetAction(
+          value: 'play_next',
+          label: 'Добавить следующим',
+          icon: Icons.playlist_play_rounded,
+        ),
+        const TrackSheetAction(
+          value: 'sleep_timer',
+          label: 'Таймер сна',
+          icon: Icons.bedtime_rounded,
+        ),
         TrackSheetAction(
           value: 'dislike',
           label: initialDisliked ? 'Убрать дизлайк' : 'Не нравится',
@@ -234,6 +245,11 @@ class TrackContextActions {
         TrackDetailsDialog.show(context, trackId);
       case 'audio_settings':
         await showAudioQualitySheet(context);
+      case 'play_next':
+        await PlaybackController.playTrackNext(trackId);
+        showAppSuccess('Трек добавлен следующим');
+      case 'sleep_timer':
+        await showSleepTimerSheet(context, trackId: trackId);
       case 'copy_link':
         final link = albumId != null
             ? 'https://music.yandex.ru/album/$albumId/track/$trackId'
