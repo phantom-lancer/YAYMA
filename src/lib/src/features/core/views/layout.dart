@@ -9,6 +9,7 @@ import 'package:yayma/src/features/album/views/album_view.dart';
 import 'package:yayma/src/features/artist/views/artist_view.dart';
 import 'package:yayma/src/features/auth/views/yandex_id_view.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
+import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/views/layout/background.dart';
 import 'package:yayma/src/features/core/views/layout/mobile_full_player.dart';
 import 'package:yayma/src/features/core/views/layout/navigation_bar.dart';
@@ -19,6 +20,7 @@ import 'package:yayma/src/features/library/views/library_view.dart';
 import 'package:yayma/src/features/library/views/playlist_view.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/features/playback/views/wave_view.dart';
+import 'package:yayma/src/features/playback/views/modern_wave_view.dart';
 import 'package:yayma/src/features/search/views/search_view.dart';
 import 'package:yayma/src/features/settings/views/settings_view.dart';
 
@@ -352,7 +354,11 @@ class _AnimatedPlayerBar extends StatelessWidget {
     return SignalBuilder(
       builder: (context) {
         final showLyrics = showLyricsSignal.value;
-        final shouldShowBar = !isHome || showLyrics;
+        final isModernAndroidWave =
+            Platform.isAndroid &&
+            currentNavStateSignal.value.section == AppSection.wave &&
+            !classicAndroidPlayerSignal.value;
+        final shouldShowBar = (!isHome || showLyrics) && !isModernAndroidWave;
 
         return AnimatedSwitcher(
           duration: const Duration(milliseconds: 600),
@@ -471,7 +477,9 @@ class _WindowContent extends StatelessWidget {
           kind: parts.length > 1 ? parts[1] : null,
         );
       case AppSection.wave:
-        return const MyWaveView();
+        return classicAndroidPlayerSignal.value
+            ? const MyWaveView()
+            : const ModernMyWaveView();
       case AppSection.account:
         return const SettingsView();
       case AppSection.yandexId:
