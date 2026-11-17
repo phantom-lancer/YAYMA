@@ -62,7 +62,7 @@ class MiniPlateSurface {
   double get alpha {
     if (!Platform.isAndroid) return lyricsStyle ? 0.5 : 0.9;
     return switch (_profile) {
-      AndroidAppearanceProfile.yayama => lyricsStyle ? 0.56 : 0.84,
+      AndroidAppearanceProfile.yayama => lyricsStyle ? 0.5 : 0.9,
       AndroidAppearanceProfile.yandexMusic => 0.76,
       AndroidAppearanceProfile.appleMusic => 0.34,
       AndroidAppearanceProfile.current => 0.62,
@@ -73,7 +73,7 @@ class MiniPlateSurface {
   double get blur {
     if (!Platform.isAndroid) return lyricsStyle ? 0.0 : 2.0;
     return switch (_profile) {
-      AndroidAppearanceProfile.yayama => lyricsStyle ? 0 : 12,
+      AndroidAppearanceProfile.yayama => lyricsStyle ? 0 : 2,
       AndroidAppearanceProfile.yandexMusic => 18,
       AndroidAppearanceProfile.appleMusic => 30,
       AndroidAppearanceProfile.current => 20,
