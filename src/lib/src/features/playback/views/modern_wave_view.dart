@@ -10,6 +10,7 @@ import 'package:yayma/src/features/core/views/widgets/responsive.dart';
 import 'package:yayma/src/features/core/views/widgets/track_elements.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/features/playback/providers/wave_provider.dart';
+import 'package:yayma/src/rust/api/models.dart';
 import 'package:yayma/src/features/playback/views/wave_view.dart'
     show showWaveSettingsSheet;
 
@@ -205,7 +206,7 @@ class _NowPlayingGlass extends StatelessWidget {
   final String title;
   final String? version;
   final String? coverUrl;
-  final List<dynamic> artists;
+  final List<TrackArtistDto> artists;
   final bool playing;
   final bool buffering;
   final bool liked;
