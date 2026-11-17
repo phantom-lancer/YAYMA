@@ -42,6 +42,9 @@ abstract final class AndroidPlayerPreferences {
   static const _fileName = 'yayma_ui_preferences.json';
   static const _profileKey = 'android_appearance_profile';
   static const _legacyKey = 'classic_android_player';
+  static const _waveVisibleKey = 'android_wave_visible';
+  static final FlutterSignal<bool?> androidWaveVisibleOverrideSignal =
+      signal<bool?>(null);
 
   static Future<File> _file() async {
     final directory = await getApplicationSupportDirectory();
@@ -73,6 +76,9 @@ abstract final class AndroidPlayerPreferences {
         androidAppearanceProfileSignal.value = profile;
         classicAndroidPlayerSignal.value =
             profile == AndroidAppearanceProfile.yayama;
+        final waveVisible = decoded[_waveVisibleKey];
+        androidWaveVisibleOverrideSignal.value =
+            waveVisible is bool ? waveVisible : null;
       }
     } on Object {
       // A damaged optional UI preference must never prevent startup.
@@ -93,6 +99,25 @@ abstract final class AndroidPlayerPreferences {
       values[_profileKey] = profile.name;
       // Keep the legacy key readable by older preview builds.
       values[_legacyKey] = profile == AndroidAppearanceProfile.yayama;
+      await file.parent.create(recursive: true);
+      await file.writeAsString(jsonEncode(values), flush: true);
+    } on Object {
+      // Keep the live choice for this session if storage is unavailable.
+    }
+  }
+
+  /// Stores the Android-specific shader preference separately from Rust's
+  /// legacy flag, which older preview builds forced off on every startup.
+  static Future<void> setWaveVisibleOverride(bool enabled) async {
+    androidWaveVisibleOverrideSignal.value = enabled;
+    try {
+      final file = await _file();
+      var values = <String, dynamic>{};
+      if (await file.exists()) {
+        final decoded = jsonDecode(await file.readAsString());
+        if (decoded is Map<String, dynamic>) values = decoded;
+      }
+      values[_waveVisibleKey] = enabled;
       await file.parent.create(recursive: true);
       await file.writeAsString(jsonEncode(values), flush: true);
     } on Object {
