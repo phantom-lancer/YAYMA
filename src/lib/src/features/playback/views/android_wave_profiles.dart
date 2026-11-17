@@ -266,7 +266,10 @@ class _YandexNowPlaying extends StatelessWidget {
           const SizedBox(height: 14),
           if (hasTrack) ...[
             const SizedBox(height: 14),
-            const CommonProgressSlider(compact: true),
+            const CommonProgressSlider(
+              compact: true,
+              accentColor: Color(0xFFFF656B),
+            ),
           ],
           const SizedBox(height: 5),
           Row(
