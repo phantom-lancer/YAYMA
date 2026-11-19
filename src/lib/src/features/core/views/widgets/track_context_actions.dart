@@ -260,9 +260,6 @@ class TrackContextActions {
         TrackDetailsDialog.show(context, trackId);
       case 'audio_settings':
         await showAudioQualitySheet(context);
-      case 'play_next':
-        await PlaybackController.playTrackNext(trackId);
-        showAppSuccess('Трек добавлен следующим');
       case 'sleep_timer':
         await showSleepTimerSheet(context);
       case 'copy_link':

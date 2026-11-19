@@ -292,9 +292,6 @@ pub async fn set_vibe_style(ctx: &AppContext, style: String) {
         .await;
 }
 
-/// Enables or disables crossfade (on = fixed-length overlap, off = strict
-/// gapless). Applied immediately through the audio signals the controller's
-/// monitor reads; persisted for the next launch.
 pub async fn set_blur_effects_enabled(ctx: &AppContext, enabled: bool) {
     let _ = ctx
         .core
@@ -315,6 +312,9 @@ pub async fn set_liquid_glass_v2_enabled(ctx: &AppContext, enabled: bool) {
         .await;
 }
 
+/// Enables or disables crossfade (on = fixed-length overlap, off = strict
+/// gapless). Applied immediately through the audio signals the controller's
+/// monitor reads; persisted for the next launch.
 pub async fn set_crossfade(ctx: &AppContext, enabled: bool) {
     let ms = if enabled {
         crate::audio::signals::USER_CROSSFADE_MS
