@@ -7,6 +7,8 @@ import 'package:flutter/services.dart' show PredictiveBackEvent;
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
+import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
+import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 import 'package:yayma/src/features/core/services/app_error.dart';
 import 'package:yayma/src/features/core/theme/app_theme.dart';
 import 'package:yayma/src/features/core/theme/app_tokens.dart';

@@ -582,7 +582,7 @@ class _WindowContent extends StatelessWidget {
           // Keep the wave controls and start button clear of the floating
           // Android player bar and bottom navigation.
           bottomPadding = 96 + MediaQuery.viewPaddingOf(context).bottom;
-        } else if (isHome && isNarrow)
+        } else if (isHome && isNarrow) {
           // Home is centered non-scrollable content: its bottom row
           // (wave settings, repeat, quality) must stay above the floating
           // navbar. Navbar top sits at 56 (height) + 12 (gap) +
