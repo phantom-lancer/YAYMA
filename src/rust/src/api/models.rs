@@ -47,6 +47,12 @@ pub struct InitialSettingsDto {
     pub vibe_render_scale: f64,
     pub blur_effects_enabled: bool,
     pub liquid_glass_v2_enabled: bool,
+    /// Which background shader to show: "aurora" (Сияние) or "wave" (Волна).
+    pub vibe_style: String,
+    /// Crossfade toggle: on = fixed-length overlap, off = strict gapless.
+    pub crossfade_enabled: bool,
+    /// "Меньше ИИ": fewer AI-generated tracks in the recommendations.
+    pub ai_content_reduction: bool,
 }
 
 impl Default for InitialSettingsDto {
@@ -59,38 +65,55 @@ impl Default for InitialSettingsDto {
             vibe_render_scale: 0.50,
             blur_effects_enabled: true,
             liquid_glass_v2_enabled: true,
+            vibe_style: "aurora".to_string(),
+            crossfade_enabled: true,
+            ai_content_reduction: false,
         }
     }
 }
 
 pub fn format_cover(uri: Option<String>, size: &str) -> Option<String> {
-    uri.map(|mut s| {
-        if let Some(pos) = s.find("%%") {
-            s.replace_range(pos..pos + 2, size);
-        }
-        if s.starts_with("//") {
-            s.insert_str(0, "https:");
-            s
-        } else if !s.starts_with("http") {
-            s.insert_str(0, "https://");
-            s
-        } else {
-            s
-        }
-    })
+    uri.as_deref().map(|s| format_cover_ref(s, size))
 }
 
-#[flutter_rust_bridge::frb(ignore)]
-pub(crate) fn get_any_cover(t: &Track) -> Option<String> {
+/// Same as [`format_cover`] for a borrowed source: callers that already hold a
+/// `&str` (the `Track` -> DTO path) skip the intermediate clone. Builds the
+/// result in one allocation instead of re-growing the source string twice.
+pub(crate) fn format_cover_ref(uri: &str, size: &str) -> String {
+    let prefix = if uri.starts_with("//") {
+        "https:"
+    } else if uri.starts_with("http") {
+        ""
+    } else {
+        "https://"
+    };
+    let mut out = String::with_capacity(prefix.len() + uri.len() + size.len());
+    out.push_str(prefix);
+    match uri.find("%%") {
+        Some(pos) => {
+            out.push_str(&uri[..pos]);
+            out.push_str(size);
+            out.push_str(&uri[pos + 2..]);
+        }
+        None => out.push_str(uri),
+    }
+    out
+}
+
+/// The cover a track would show at `size`, without cloning the source URI.
+pub(crate) fn cover_ref(t: &Track, size: &str) -> Option<String> {
+    any_cover(t).map(|u| format_cover_ref(u, size))
+}
+
+fn any_cover(t: &Track) -> Option<&str> {
     t.og_image
-        .as_ref()
-        .or(t.cover_uri.as_ref())
+        .as_deref()
+        .or(t.cover_uri.as_deref())
         .or_else(|| {
             t.albums
                 .first()
-                .and_then(|a| a.og_image.as_ref().or(a.cover_uri.as_ref()))
+                .and_then(|a| a.og_image.as_deref().or(a.cover_uri.as_deref()))
         })
-        .cloned()
 }
 
 /// `cover.uri` is empty for playlists using an auto-generated "mosaic" cover
@@ -102,6 +125,31 @@ fn get_playlist_cover(playlist: &mut Playlist) -> Option<String> {
         let og_image = std::mem::take(&mut playlist.og_image);
         (!og_image.is_empty()).then_some(og_image)
     })
+}
+
+#[cfg(test)]
+mod format_cover_tests {
+    use super::format_cover_ref;
+
+    #[test]
+    fn replaces_size_template_and_adds_scheme() {
+        assert_eq!(
+            format_cover_ref("//avatars.yandex.net/a/%%/x", "600x600"),
+            "https://avatars.yandex.net/a/600x600/x"
+        );
+        assert_eq!(
+            format_cover_ref("avatars.yandex.net/a/%%", "200x200"),
+            "https://avatars.yandex.net/a/200x200"
+        );
+        assert_eq!(
+            format_cover_ref("https://avatars.yandex.net/a/%%", "orig"),
+            "https://avatars.yandex.net/a/orig"
+        );
+        assert_eq!(
+            format_cover_ref("https://cdn/plain.jpg", "600x600"),
+            "https://cdn/plain.jpg"
+        );
+    }
 }
 
 #[flutter_rust_bridge::frb(unignore)]
@@ -137,6 +185,14 @@ impl TrackArtistDto {
             name: a.name.clone().unwrap_or_default(),
         }
     }
+
+    /// Owned counterpart for callers that already consumed the model.
+    pub fn from_yandex_owned(mut a: yandex_music::model::artist::Artist) -> Self {
+        Self {
+            id: a.id.take().unwrap_or_default(),
+            name: a.name.take().unwrap_or_default(),
+        }
+    }
 }
 
 #[flutter_rust_bridge::frb(unignore)]
@@ -152,6 +208,16 @@ pub struct SimpleTrackDto {
     pub cover_url: Option<String>,
     pub is_liked: bool,
     pub is_disliked: bool,
+}
+
+/// Playhead neighbourhood: the tracks around the playhead plus the resolved
+/// previous/next previews under the real repeat policy.
+#[flutter_rust_bridge::frb(unignore)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueueNeighborhoodDto {
+    pub tracks: Vec<SimpleTrackDto>,
+    pub previous: Option<SimpleTrackDto>,
+    pub next: Option<SimpleTrackDto>,
 }
 
 #[flutter_rust_bridge::frb(ignore)]
@@ -176,7 +242,7 @@ impl SimpleTrackDto {
             album: album_title,
             album_id,
             duration_ms: t.duration.map(|d| d.as_millis() as u32).unwrap_or(0),
-            cover_url: format_cover(get_any_cover(t), COVER_SIZE_MEDIUM),
+            cover_url: any_cover(t).map(|u| format_cover_ref(u, COVER_SIZE_MEDIUM)),
             is_liked: liked_ids.contains(track_id_base),
             is_disliked: disliked_ids.contains(track_id_base),
         }
@@ -189,7 +255,7 @@ impl SimpleTrackDto {
     ) -> Self {
         let is_liked = liked_ids.contains(t.id.to_base_id());
         let is_disliked = disliked_ids.contains(t.id.to_base_id());
-        let cover_url = format_cover(get_any_cover(&t), COVER_SIZE_MEDIUM);
+        let cover_url = any_cover(&t).map(|u| format_cover_ref(u, COVER_SIZE_MEDIUM));
         let (album_title, album_id) = t
             .albums
             .first_mut()
@@ -271,6 +337,17 @@ pub enum RepeatModeDto {
     Single,
 }
 
+/// Active playback context projection. `kind` is one of
+/// "playlist"|"album"|"artist"|"track"|"wave"|"standalone"; `title` is only
+/// set when the context carried one at load time.
+#[flutter_rust_bridge::frb(unignore)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaybackContextDto {
+    pub kind: String,
+    pub id: Option<String>,
+    pub title: Option<String>,
+}
+
 #[flutter_rust_bridge::frb(unignore)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlaybackState {
@@ -282,9 +359,13 @@ pub struct PlaybackState {
     pub is_shuffled: bool,
     pub queue_count: u32,
     pub queue_index: u32,
+    /// Changes whenever the queue is replaced or reordered, even when the new
+    /// queue has the same length as the old one.
+    pub queue_revision: u32,
     pub current_track: Option<SimpleTrackDto>,
     pub current_wave_seeds: Vec<String>,
     pub codec: Option<String>,
+    pub playback_context: Option<PlaybackContextDto>,
 }
 
 #[flutter_rust_bridge::frb(unignore)]
@@ -318,8 +399,8 @@ impl AlbumDetailsDto {
         let year = album.year.map(|y| y as i32);
         let artists = album
             .artists
-            .iter()
-            .map(TrackArtistDto::from_yandex)
+            .into_iter()
+            .map(TrackArtistDto::from_yandex_owned)
             .collect();
 
         let tracks = album
@@ -376,8 +457,8 @@ impl SimpleAlbumDto {
             title: album.title.take().unwrap_or_default(),
             artists: album
                 .artists
-                .iter()
-                .map(TrackArtistDto::from_yandex)
+                .into_iter()
+                .map(TrackArtistDto::from_yandex_owned)
                 .collect(),
             cover_url: format_cover(album.og_image.take(), "600x600"),
             year: album.year.map(|y| y as i32),
@@ -426,9 +507,7 @@ impl PlaylistDetailsDto {
         let cover_url = format_cover(get_playlist_cover(&mut playlist), "600x600");
         let title = std::mem::take(&mut playlist.title);
         let track_count = playlist.track_count;
-        let is_public = format!("{:?}", playlist.visibility)
-            .to_lowercase()
-            .contains("public");
+        let is_public = playlist.visibility.to_ascii_lowercase().contains("public");
 
         Self {
             kind: playlist.kind,
@@ -456,9 +535,7 @@ pub struct SimplePlaylistDto {
 #[flutter_rust_bridge::frb(ignore)]
 impl SimplePlaylistDto {
     pub fn from_yandex(mut playlist: Playlist) -> Self {
-        let is_public = format!("{:?}", playlist.visibility)
-            .to_lowercase()
-            .contains("public");
+        let is_public = playlist.visibility.to_ascii_lowercase().contains("public");
         Self {
             kind: playlist.kind,
             uid: playlist.uid as i64,
@@ -518,8 +595,19 @@ pub struct LyricsLineDto {
 
 #[flutter_rust_bridge::frb(unignore)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LyricItemDto {
+    /// Start of the item on the track timeline.
+    pub time_ms: i64,
+    /// How long the item stays current: the text of a line, or a pause.
+    pub duration_ms: i64,
+    /// `None` means a pause/timer between lines, not a lyric line.
+    pub line: Option<LyricsLineDto>,
+}
+
+#[flutter_rust_bridge::frb(unignore)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LyricsResultDto {
-    pub lines: Vec<LyricsLineDto>,
+    pub timeline: Vec<LyricItemDto>,
     pub provider_name: String,
 }
 
@@ -613,12 +701,29 @@ pub enum AppError {
     Unknown(String),
 }
 
+/// Only the music API host answers 401 for a bad token. A 401 from a CDN or
+/// avatar host means the URL is stale, not that the session died — treating it
+/// as an auth failure logged users out mid-track.
+const AUTH_HOST: &str = "api.music.yandex.net";
+
+/// True when [host] is (or cannot be determined to be anything but) the auth
+/// host; an unknown host keeps the previous, conservative behaviour.
+fn is_auth_host_str(host: Option<&str>) -> bool {
+    host.is_none_or(|h| h == AUTH_HOST)
+}
+
+/// True when [url] is (or cannot be determined to be anything but) the auth
+/// host; an unknown URL keeps the previous, conservative behaviour.
+fn is_auth_host(url: Option<&reqwest::Url>) -> bool {
+    is_auth_host_str(url.and_then(|u| u.host_str()))
+}
+
 impl From<yandex_music::error::ClientError> for AppError {
     fn from(err: yandex_music::error::ClientError) -> Self {
         match err {
             yandex_music::error::ClientError::RequestError { error } => {
                 let s = error.to_string();
-                if s.contains("401") {
+                if s.contains("401") && is_auth_host(error.url()) {
                     AppError::Unauthorized
                 } else if s.contains("404") {
                     AppError::NotFound(s)
@@ -650,7 +755,7 @@ impl From<rusqlite::Error> for AppError {
 impl From<reqwest::Error> for AppError {
     fn from(err: reqwest::Error) -> Self {
         let s = err.to_string();
-        if s.contains("401") {
+        if s.contains("401") && is_auth_host(err.url()) {
             AppError::Unauthorized
         } else if s.contains("404") {
             AppError::NotFound(s)
@@ -672,8 +777,24 @@ impl From<std::io::Error> for AppError {
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for AppError {
     fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        // `send_with_retry` boxes an [HttpStatusError](crate::http::HttpStatusError)
+        // that still knows its host: apply the same host rule as the typed
+        // branches above instead of string matching, so a stale CDN link's
+        // 401 is not mistaken for a dead session.
+        if let Some(e) = err.downcast_ref::<crate::http::HttpStatusError>() {
+            return match e.status {
+                401 if is_auth_host_str(e.host.as_deref()) => AppError::Unauthorized,
+                404 => AppError::NotFound(e.to_string()),
+                429 => AppError::RateLimited,
+                _ => AppError::ApiError(e.to_string()),
+            };
+        }
         let s = err.to_string();
-        if s.contains("401") || s.contains("unauthorized") {
+        // Same host rule as above, for errors that still carry their request.
+        let auth_401 = err
+            .downcast_ref::<reqwest::Error>()
+            .is_none_or(|e| is_auth_host(e.url()));
+        if (s.contains("401") || s.contains("unauthorized")) && auth_401 {
             AppError::Unauthorized
         } else if s.contains("404") || s.contains("not found") {
             AppError::NotFound(s)
@@ -684,5 +805,35 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for AppError {
         } else {
             AppError::ApiError(s)
         }
+    }
+}
+
+#[cfg(test)]
+mod boxed_401_tests {
+    use super::AppError;
+    use crate::http::HttpStatusError;
+
+    fn boxed(status: u16, host: &str) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(HttpStatusError {
+            status,
+            host: Some(host.to_string()),
+        })
+    }
+
+    #[test]
+    fn boxed_401_from_auth_host_is_unauthorized() {
+        assert!(matches!(
+            AppError::from(boxed(401, "api.music.yandex.net")),
+            AppError::Unauthorized
+        ));
+    }
+
+    #[test]
+    fn boxed_401_from_cdn_host_is_not_unauthorized() {
+        // A stale signed download link answers 401 without the session dying.
+        assert!(!matches!(
+            AppError::from(boxed(401, "strm.yandex.net")),
+            AppError::Unauthorized
+        ));
     }
 }

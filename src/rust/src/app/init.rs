@@ -1,5 +1,5 @@
 use crate::app::AUDIO_READY;
-use crate::app::context::AppContext;
+use crate::app::context::{AppAudioContext, AppContext, AppCoreContext};
 use crate::app::settings::load_persisted_settings;
 use crate::app::workers;
 use crate::audio::system::AudioSystem;
@@ -14,6 +14,16 @@ use tokio::sync::Mutex;
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 static DATABASE: tokio::sync::OnceCell<Arc<Mutex<AppDatabase>>> =
     tokio::sync::OnceCell::const_new();
+
+/// The live session's context. `clear_token` is the FRB logout and takes no
+/// context argument, so this static is its only handle to the stack it must
+/// tear down. One session is live at a time: login overwrites, logout takes.
+static CURRENT: parking_lot::RwLock<Option<AppContext>> = parking_lot::RwLock::new(None);
+
+/// Takes the live context for teardown. Only the logout path may call this.
+pub fn take_context() -> Option<AppContext> {
+    CURRENT.write().take()
+}
 
 pub async fn get_database()
 -> Result<Arc<Mutex<AppDatabase>>, Box<dyn std::error::Error + Send + Sync>> {
@@ -38,21 +48,30 @@ pub async fn initialize_app(
     initialize_services(api).await
 }
 
-/// Initialize base infrastructure (logging, panic hook, DB)
-/// Called once at FRB startup
+/// Initialize base infrastructure (panic hook, DB, logging)
+/// Called once at FRB startup (with `None`) and again from Dart right after,
+/// with the real data dir. The log file lives in the data dir, so logging
+/// starts only on that second call; before it, the panic hook is the only
+/// reporter.
 pub fn initialize_infrastructure(base_path: Option<String>) {
-    if let Some(path) = base_path {
+    if let Some(path) = &base_path {
         let p = PathBuf::from(path);
         std::fs::create_dir_all(&p).ok();
         DATA_DIR.set(p).ok();
     }
 
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
+    static INIT_ONCE: std::sync::Once = std::sync::Once::new();
+    INIT_ONCE.call_once(|| {
         flutter_rust_bridge::setup_default_user_utils();
         crate::util::hook::set_panic_hook();
-        let _ = crate::util::log::initialize_logging();
     });
+
+    static LOG_ONCE: std::sync::Once = std::sync::Once::new();
+    if base_path.is_some() {
+        LOG_ONCE.call_once(|| {
+            let _ = crate::util::log::initialize_logging();
+        });
+    }
 }
 
 async fn initialize_services(
@@ -76,29 +95,46 @@ async fn initialize_services(
     let track_cache = Arc::new(TrackCache::new(DATA_DIR.get().cloned()));
     let _ = track_cache.init().await;
 
+    // Created here (not in AppContext::new) so the audio stack can be wired
+    // to the same shutdown channel the context will hold.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     let (audio_tx, signals, state, effect_handles) = AudioSystem::spawn(
         error_reporter,
         api_arc.clone(),
         db_arc.clone(),
         http_cache.clone(),
         track_cache.clone(),
+        shutdown_rx.clone(),
     )
     .await?;
 
-    let (context, shutdown_rx) = AppContext::new(
-        audio_tx,
-        api_arc.clone(),
-        db_arc,
-        http_cache,
-        track_cache,
-        signals.clone(),
-        state,
-        effect_handles.clone(),
+    let context = AppContext::new(
+        AppAudioContext {
+            tx: audio_tx,
+            signals,
+            state,
+            effect_handles,
+        },
+        AppCoreContext {
+            api: api_arc.clone(),
+            db: db_arc,
+            http_cache,
+            track_cache,
+        },
         event_sink,
+        shutdown_tx,
     );
+    *CURRENT.write() = Some(context.clone());
 
     load_persisted_settings(&context).await;
-    context.audio.signals.monitor.set_enabled(true);
+    // The monitor feeds only the vibe shader: keep it off while the shader is
+    // disabled instead of running the band split for every audio block.
+    context
+        .audio
+        .signals
+        .monitor
+        .set_enabled(context.audio.signals.vibe_enabled.get());
 
     workers::spawn_sync_worker(context.clone(), shutdown_rx.clone());
     workers::spawn_bridge_worker(context.clone(), shutdown_rx.clone());

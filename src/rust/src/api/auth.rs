@@ -1,12 +1,45 @@
 use crate::api::models::{AppError, SavedStateDto, UserAccountDto};
 use crate::app::{AppContext, initialize_app, initialize_infrastructure};
 use crate::auth::TokenProvider;
+use crate::auth::device;
 use crate::http::ApiService;
 use flutter_rust_bridge::frb;
+use serde::{Deserialize, Serialize};
 
 #[frb(init)]
 pub fn init_app() {
     initialize_infrastructure(None);
+}
+
+#[flutter_rust_bridge::frb(unignore)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceCodeDto {
+    pub user_code: String,
+    pub device_code: String,
+    pub verification_url: String,
+    /// Defaults to 5 s when the provider omits it.
+    #[serde(default = "default_interval")]
+    pub interval: u32,
+}
+
+fn default_interval() -> u32 {
+    5
+}
+
+#[flutter_rust_bridge::frb(unignore)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceTokenDto {
+    pub access_token: Option<String>,
+    /// Provider rejection message; `None` while the user has not confirmed yet.
+    pub error: Option<String>,
+}
+
+pub async fn yandex_device_code() -> Result<DeviceCodeDto, AppError> {
+    device::request_device_code().await
+}
+
+pub async fn yandex_device_token(device_code: String) -> Result<DeviceTokenDto, AppError> {
+    device::poll_token(&device_code).await
 }
 
 pub async fn restore_saved_state(ctx: &AppContext) -> Option<SavedStateDto> {
@@ -23,21 +56,29 @@ pub async fn restore_saved_state(ctx: &AppContext) -> Option<SavedStateDto> {
 }
 
 pub async fn clear_token() {
+    tracing::info!("user_logout");
+    // Explicit teardown: `Drop` never fires for the audio stack (desktop
+    // statics hold context clones forever), so without this a logout would
+    // leak a whole second stack on re-login and the sync worker would keep
+    // calling the server with the dead account's token.
+    if let Some(ctx) = crate::app::init::take_context() {
+        ctx.shutdown().await;
+    }
     if let Err(e) = TokenProvider::delete().await {
-        tracing::error!("Failed to delete auth token: {:?}", e);
+        tracing::error!(error = ?e, "delete_auth_token_failed");
     }
     // Drop the persisted liked-tracks revision so the next account starts
     // with a full snapshot instead of someone else's revision.
     if let Ok(database) = crate::app::get_database().await {
         let mut db = database.lock().await;
         if let Err(e) = db.delete_setting("liked_tracks_revision").await {
-            tracing::error!("Failed to delete liked revision: {:?}", e);
+            tracing::error!(error = ?e, "delete_liked_revision_failed");
         }
         if let Err(e) = db
             .delete_setting(crate::api::library::DISLIKED_TRACKS_KEY)
             .await
         {
-            tracing::error!("Failed to delete disliked tracks: {:?}", e);
+            tracing::error!(error = ?e, "delete_disliked_tracks_failed");
         }
     }
 }
@@ -48,12 +89,14 @@ pub async fn login_with_token(token: String) -> Result<AppContext, AppError> {
         .map_err(|_| AppError::InvalidToken)?;
 
     if let Err(e) = TokenProvider::store(&token, user_id).await {
-        tracing::error!("Failed to store auth token during login: {:?}", e);
+        tracing::error!(error = ?e, "store_auth_token_failed");
     }
 
     let api = ApiService::new(token, Some(user_id))
         .await
         .map_err(|e| AppError::ApiError(e.to_string()))?;
+
+    tracing::info!("user_login");
 
     initialize_app(api)
         .await
@@ -67,11 +110,32 @@ pub async fn try_auto_login() -> Option<AppContext> {
     if let Ok(api) = ApiService::new(token.clone(), Some(user_id)).await
         && let Ok(ctx) = initialize_app(api).await
     {
+        tracing::info!("user_login");
+        // The fast path never validated the token: probe in the background so
+        // a dead token surfaces as one deliberate expiry event instead of a
+        // 401 from every later fetch. The Dart handler re-confirms it before
+        // logging out.
+        let probe = ctx.clone();
+        tokio::spawn(async move {
+            if !probe.core.api.verify_auth().await {
+                tracing::info!("auto_login_token_invalid");
+                probe.send_event(crate::api::simple::AppEvent::Error(
+                    "Invalid token or session expired".to_string(),
+                ));
+            }
+        });
         return Some(ctx);
     }
 
     // Fallback if the fast path fails for any reason
     login_with_token(token).await.ok()
+}
+
+#[frb]
+/// Confirms the session is really dead before the UI logs out: a single 401
+/// can be transient or come from a stale URL.
+pub async fn verify_auth(ctx: &AppContext) -> bool {
+    ctx.core.api.verify_auth().await
 }
 
 #[frb]
@@ -90,12 +154,12 @@ pub async fn get_account_info(ctx: &AppContext) -> Option<UserAccountDto> {
                 Ok(fresh) => {
                     let mut db = ctx_clone.core.db.lock().await;
                     if let Err(e) = db.save_setting("account_info", &fresh).await {
-                        tracing::error!("Failed to cache account info: {:?}", e);
+                        tracing::error!(error = ?e, "cache_account_info_failed");
                     }
                     ctx_clone.send_event(crate::api::simple::AppEvent::AccountUpdated(fresh));
                 }
                 Err(e) => {
-                    tracing::error!("Failed to refresh account info: {:?}", e);
+                    tracing::error!(error = ?e, "refresh_account_info_failed");
                 }
             }
         });
@@ -107,12 +171,12 @@ pub async fn get_account_info(ctx: &AppContext) -> Option<UserAccountDto> {
         Ok(account) => {
             let mut db = ctx.core.db.lock().await;
             if let Err(e) = db.save_setting("account_info", &account).await {
-                tracing::error!("Failed to cache account info: {:?}", e);
+                tracing::error!(error = ?e, "cache_account_info_failed");
             }
             Some(account)
         }
         Err(e) => {
-            tracing::error!("Failed to fetch account info: {:?}", e);
+            tracing::error!(error = ?e, "fetch_account_info_failed");
             None
         }
     }

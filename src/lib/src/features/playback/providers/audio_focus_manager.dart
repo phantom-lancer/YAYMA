@@ -1,8 +1,8 @@
 import 'dart:async';
 
 import 'package:audio_session/audio_session.dart';
-import 'package:flutter/foundation.dart';
 import 'package:signals_flutter/signals_flutter.dart';
+import 'package:yayma/src/features/core/services/app_logger.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 
 /// Bridges audio_session interruptions to the Rust playback engine.
@@ -23,6 +23,7 @@ class AudioFocusManager {
   static bool _ducked = false;
   static bool _sessionActive = false;
   static int _transientGain = 100;
+  static bool _lastObservedPlaying = false;
 
   static const _duckGain = 20;
   static const _duckFadeDuration = Duration(milliseconds: 200);
@@ -39,7 +40,7 @@ class AudioFocusManager {
         );
       },
       onError: (Object e, StackTrace st) {
-        debugPrint('Audio interruption stream error: $e');
+        appLog(AppLogLevel.warn, 'audio interruption stream error: $e');
       },
     );
 
@@ -52,13 +53,14 @@ class AudioFocusManager {
         );
       },
       onError: (Object e, StackTrace st) {
-        debugPrint('Audio becoming-noisy stream error: $e');
+        appLog(AppLogLevel.warn, 'audio becoming-noisy stream error: $e');
       },
     );
 
     _disposeSessionActiveEffect?.call();
     _disposeSessionActiveEffect = effect(() {
       final isPlaying = playerStateSignal()?.isPlaying ?? false;
+      _onPlayingObserved(isPlaying);
       _sessionQueue = _sessionQueue.then(
         (_) => _syncSessionActive(session, isPlaying),
       );
@@ -83,6 +85,22 @@ class AudioFocusManager {
     _ducked = false;
     _sessionActive = false;
     _transientGain = 100;
+    _lastObservedPlaying = false;
+  }
+
+  /// While a transient interruption has the player paused, only a manual
+  /// action can RAISE the playing flag: this manager resumes after clearing
+  /// the transient state, and its own begin-pause only ever lowers it. An
+  /// observed rise (not just a re-run with `true`, which any unrelated
+  /// state event can cause) therefore means the user acted during the call
+  /// — they take over, and the interruption-end must not auto-resume on
+  /// top of a later explicit pause.
+  static void _onPlayingObserved(bool isPlaying) {
+    if (isPlaying && !_lastObservedPlaying && _transientPauseActive) {
+      _transientPauseActive = false;
+      _resumeAfterTransient = false;
+    }
+    _lastObservedPlaying = isPlaying;
   }
 
   static Future<void> _handleInterruption(AudioInterruptionEvent event) async {
@@ -100,6 +118,11 @@ class AudioFocusManager {
           }
         case AudioInterruptionType.pause:
           if (event.begin) {
+            // Focus systems report state changes, not stacks: while a
+            // transient loss is already active, Android delivers no event
+            // for another identical loss, so a second begin is a platform
+            // echo. Keeping the first begin's frozen resume intent keeps it
+            // paired with the single pause-end that will follow.
             if (_transientPauseActive) return;
             // A stronger interruption supersedes ducking. Android clears its
             // duck state here and later sends pause-end, not duck-end, so the
@@ -131,7 +154,7 @@ class AudioFocusManager {
           }
       }
     } on Object catch (e, st) {
-      debugPrint('Audio interruption handling failed: $e\n$st');
+      appLog(AppLogLevel.warn, 'audio interruption handling failed: $e $st');
     }
   }
 
@@ -145,7 +168,7 @@ class AudioFocusManager {
       }
       if (isPlayingSignal.value) await PlaybackController.pause();
     } on Object catch (e, st) {
-      debugPrint('Audio becoming-noisy handling failed: $e\n$st');
+      appLog(AppLogLevel.warn, 'audio becoming-noisy handling failed: $e $st');
     }
   }
 
@@ -183,7 +206,7 @@ class AudioFocusManager {
         _sessionActive = false;
       }
     } on Object catch (e, st) {
-      debugPrint('Failed to sync audio session active state: $e\n$st');
+      appLog(AppLogLevel.warn, 'audio session active sync failed: $e $st');
     }
   }
 }

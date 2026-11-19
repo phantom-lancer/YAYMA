@@ -1,8 +1,9 @@
 use crate::audio::cache::UrlCache;
+use crate::audio::plays::{EndReason, PlayContext};
 use crate::{
     audio::{
-        commands::AudioMessage, controller::AudioController,
-        fetcher::is_usable_wave_session, playback::PlaybackEngine, progress::TrackProgress,
+        commands::AudioMessage, controller::AudioController, fetcher::is_usable_wave_session,
+        playback::PlaybackEngine, plays::PlayReporter, progress::TrackProgress,
         queue::QueueManager, queue::as_wave_seed, signals::AudioSignals, state::SystemState,
         stream_manager::StreamManager, yandex::YandexProvider,
     },
@@ -12,13 +13,12 @@ use crate::{
 #[cfg(not(any(target_os = "android")))]
 use crate::audio::{discord::DiscordManager, smtc::SmtcManager};
 
-use parking_lot::RwLock as PRwLock;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{RwLock, mpsc};
 #[cfg(not(any(target_os = "android")))]
 use tokio::sync::Mutex;
+use tokio::sync::{RwLock, mpsc};
 use yandex_music::model::track::Track;
 
 #[path = "system_loading.rs"]
@@ -58,10 +58,12 @@ impl Drop for AbortOnDrop {
 }
 
 // Selects the head of the unified advance path (ended vs user skip).
+// A skip carries the plays-report end reason: `skip`, or `dislike` for a
+// dislike-driven skip (the desktop client distinguishes them).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AdvanceReason {
     TrackEnded,
-    Skipped,
+    Skipped(EndReason),
 }
 
 pub type EffectHandles =
@@ -69,10 +71,21 @@ pub type EffectHandles =
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const PREVIOUS_TRACK_RESTART_THRESHOLD: Duration = Duration::from_secs(5);
 
+/// Stored form of the persisted repeat mode.
+fn repeat_mode_key(mode: crate::audio::enums::RepeatMode) -> String {
+    match mode {
+        crate::audio::enums::RepeatMode::None => "none",
+        crate::audio::enums::RepeatMode::All => "all",
+        crate::audio::enums::RepeatMode::Single => "single",
+    }
+    .to_string()
+}
+
 pub struct AudioSystem {
     controller: AudioController,
     queue: QueueManager,
     yandex: YandexProvider,
+    plays: PlayReporter,
     error_sink: Arc<dyn Fn(String) + Send + Sync>,
     state: Arc<RwLock<SystemState>>,
     signals: AudioSignals,
@@ -90,6 +103,7 @@ impl AudioSystem {
         db: Arc<tokio::sync::Mutex<crate::db::AppDatabase>>,
         _http_cache: Arc<crate::storage::cache::HttpCache>,
         track_cache: Arc<crate::storage::cache::TrackCache>,
+        _shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(
         mpsc::Sender<AudioMessage>,
         AudioSignals,
@@ -113,7 +127,6 @@ impl AudioSystem {
 
         let signals = AudioSignals::new();
         let track_progress_inner = Arc::new(TrackProgress::default());
-        let track_progress = Arc::new(PRwLock::new(track_progress_inner.clone()));
 
         let controller = AudioController::new(
             engine,
@@ -121,7 +134,7 @@ impl AudioSystem {
             tx.clone(),
             error_sink.clone(),
             signals.clone(),
-            track_progress.clone(),
+            track_progress_inner.clone(),
         );
 
         let queue = QueueManager::new(
@@ -138,8 +151,11 @@ impl AudioSystem {
         {
             let mut db = db.lock().await;
             if let Ok(ids) = db.load_liked_tracks().await {
-                let revision: Option<u64> =
-                    db.load_setting("liked_tracks_revision").await.ok().flatten();
+                let revision: Option<u64> = db
+                    .load_setting("liked_tracks_revision")
+                    .await
+                    .ok()
+                    .flatten();
                 let disliked: Vec<String> = db
                     .load_setting(crate::api::library::DISLIKED_TRACKS_KEY)
                     .await
@@ -160,11 +176,14 @@ impl AudioSystem {
             let smtc = Arc::new(Mutex::new(SmtcManager::new(
                 smtc_cmd_tx,
                 _http_cache.clone(),
+                signals.current_track_id.clone(),
             )?));
             (smtc, smtc_cmd_rx)
         };
 
         let yandex = YandexProvider::new(api.clone(), signals.clone());
+
+        let plays = PlayReporter::new(api.clone());
 
         let effect_handles = controller.get_effect_handles();
 
@@ -172,6 +191,7 @@ impl AudioSystem {
             controller,
             queue,
             yandex,
+            plays,
             error_sink: error_sink.clone(),
             state: state.clone(),
             signals: signals.clone(),
@@ -186,7 +206,7 @@ impl AudioSystem {
 
         // Start Discord integration
         #[cfg(not(any(target_os = "android")))]
-        DiscordManager::spawn(signals.clone());
+        DiscordManager::spawn(signals.clone(), _shutdown_rx.clone());
 
         // Background task for SMTC
         #[cfg(not(any(target_os = "android")))]
@@ -204,7 +224,7 @@ impl AudioSystem {
         // Monitor signals to update SMTC
         #[cfg(not(any(target_os = "android")))]
         {
-            let smtc_clone = smtc.clone();
+            let smtc_clone = smtc;
             let signals_clone = signals.clone();
             let poll_handle = tokio::spawn(async move {
                 let mut last_track_id = None;
@@ -248,11 +268,40 @@ impl AudioSystem {
             // notify permit when the message branch wins, losing the wake-up.
             // Replace it only after it actually fires.
             let mut fetch_notified = Box::pin(fetch_finished.notified());
+            // Coarse clock for `/plays` progress reports (one per 30 s played).
+            let mut report_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            report_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     msg = rx.recv() => {
                         let Some(msg) = msg else { break };
-                        system_loop.process_message(msg).await;
+                        if matches!(msg, AudioMessage::Shutdown) {
+                            // Only way out of this loop: the actor holds one
+                            // of the channel's senders itself, so `recv()`
+                            // never yields `None`. Breaking here lets the
+                            // post-loop teardown below finally run.
+                            break;
+                        }
+                        if matches!(msg, AudioMessage::Next) {
+                            // Skip-burst debounce: collapse already-queued
+                            // Next presses into a single advance without
+                            // waiting. A non-Next message drained first is
+                            // processed right after.
+                            let mut pending_other = None;
+                            while let Ok(extra) = rx.try_recv() {
+                                if matches!(extra, AudioMessage::Next) {
+                                    continue;
+                                }
+                                pending_other = Some(extra);
+                                break;
+                            }
+                            system_loop.process_message(msg).await;
+                            if let Some(other) = pending_other {
+                                system_loop.process_message(other).await;
+                            }
+                        } else {
+                            system_loop.process_message(msg).await;
+                        }
                     }
                     _ = fetch_notified.as_mut() => {
                         fetch_notified = Box::pin(fetch_finished.notified());
@@ -264,11 +313,18 @@ impl AudioSystem {
                         let nothing_ahead = system_loop.queue.has_no_visible_next();
                         system_loop.queue.refill_wave_window(grew && nothing_ahead);
                     }
+                    _ = report_tick.tick() => {
+                        let playing = system_loop.signals.is_playing.get();
+                        let position = std::time::Duration::from_millis(
+                            system_loop.signals.position_ms.get(),
+                        );
+                        system_loop.plays.tick(playing, position);
+                    }
                 }
             }
-            // Channel closed on context teardown: stop SMTC loops and the
-            // controller monitor/playback task in a defined order instead
-            // of relying on Drop alone (Drop guards stay as a backstop).
+            // Close the active listen so teardown (e.g. re-login) mid-track
+            // doesn't leave a dangling play server-side.
+            system_loop.report_track_end(EndReason::OtherTrack);
             system_loop.shutdown().await;
         });
 
@@ -365,6 +421,86 @@ impl AudioSystem {
         self.load_context_inner(None, ctx, tracks, index).await;
     }
 
+    /// Desktop getPlayContextRequestKey parity: clicking a track that belongs
+    /// to the context already playing must not rebuild the queue — it jumps
+    /// to that position instead, preserving shuffle, wave state and queue
+    /// edits. Returns false when the context differs (or the track is not in
+    /// the queue) so the caller falls back to the rebuild.
+    async fn try_jump_within_context(
+        &mut self,
+        source: &system_loading::SingleTrackSource,
+        tid: &str,
+    ) -> bool {
+        let matched = self.queue.with_playback_context(|ctx| match (ctx, source) {
+            (
+                crate::audio::queue::PlaybackContext::Album(album),
+                system_loading::SingleTrackSource::AlbumTrack { album_id },
+            ) => album.id == Some(*album_id),
+            (
+                crate::audio::queue::PlaybackContext::Playlist(playlist),
+                system_loading::SingleTrackSource::PlaylistTrack { kind },
+            ) => playlist.kind == *kind,
+            // Liked tracks play through the private playlist kind 3.
+            (
+                crate::audio::queue::PlaybackContext::Playlist(playlist),
+                system_loading::SingleTrackSource::Liked,
+            ) => playlist.kind == 3,
+            _ => false,
+        });
+        if !matched {
+            return false;
+        }
+        let position = self
+            .signals
+            .queue
+            .with(|q| q.iter().position(|t| t.id == tid));
+        match position {
+            Some(index) => {
+                self.play_queue_index(index).await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Queue-position jump (user tap on a queue row or an idempotent
+    /// context re-click): starts the target track through the same
+    /// preheat-or-play path the unified advance uses.
+    async fn play_queue_index(&mut self, index: usize) {
+        let Some(track) = self.queue.jump_to(index) else {
+            return;
+        };
+        self.report_track_end(EndReason::Skip);
+        if self.queue.in_wave() {
+            self.send_wave_track_started(&track);
+        }
+        if self.controller.can_activate_preheat(&track.id) {
+            self.controller.activate_preheat(track.clone());
+        } else {
+            self.controller
+                .play_track(track.clone(), false, Duration::ZERO, false)
+                .await;
+        }
+        self.report_track_start(&track, Duration::ZERO, false);
+    }
+
+    /// Fire-and-forget settings write; the actor never waits on the DB.
+    fn persist_setting<T: serde::Serialize + Clone + Send + Sync + 'static>(
+        &self,
+        key: &str,
+        value: &T,
+    ) {
+        let db = self.db.clone();
+        let key = key.to_string();
+        let value = value.clone();
+        tokio::spawn(async move {
+            let mut db = db.lock().await;
+            if let Err(e) = db.save_setting(&key, &value).await {
+                tracing::error!(error = ?e, key = %key, "persist_setting_failed");
+            }
+        });
+    }
+
     async fn load_fetched_context(
         &mut self,
         generation: u64,
@@ -411,6 +547,7 @@ impl AudioSystem {
             if in_wave {
                 self.send_wave_track_started(&track);
             }
+            self.report_track_start(&track, Duration::ZERO, false);
         }
     }
 
@@ -426,15 +563,20 @@ impl AudioSystem {
             .await
         {
             self.controller
-                .play_track(track, start_paused, position, false)
+                .play_track(track.clone(), start_paused, position, false)
                 .await;
+            self.report_track_start(&track, position, start_paused);
         }
     }
 
     async fn recreate_stream(&mut self) {
         let device = self.signals.selected_device.get();
-        if let Err(e) = self.controller.recreate_engine(device.as_deref()) {
-            tracing::error!("Failed to recreate stream: {}", e);
+        if let Err(e) = self.controller.recreate_engine(device.as_deref()).await {
+            // The old stream keeps running (recreate swaps state only after
+            // the new device opens), so the user must hear about the failure
+            // instead of wondering why nothing changed.
+            tracing::error!(error = %e, "recreate_stream_failed");
+            (self.error_sink)(format!("Failed to recreate audio stream: {e}"));
         } else {
             self.reload_track().await;
         }
@@ -466,14 +608,23 @@ impl AudioSystem {
             },
             AudioMessage::PlayPause => {
                 if self.signals.is_playing.get() {
+                    self.report_pause();
                     self.controller.pause().await;
                 } else {
+                    self.report_resume();
                     self.controller.resume().await;
                 }
             }
-            AudioMessage::Pause => self.controller.pause().await,
-            AudioMessage::Resume => self.controller.resume().await,
+            AudioMessage::Pause => {
+                self.report_pause();
+                self.controller.pause().await;
+            }
+            AudioMessage::Resume => {
+                self.report_resume();
+                self.controller.resume().await;
+            }
             AudioMessage::Stop => {
+                self.report_track_end(EndReason::OtherTrack);
                 self.begin_context_change();
                 self.controller.stop().await;
                 self.queue.clear();
@@ -485,26 +636,82 @@ impl AudioSystem {
                 if self.signals.position_ms.get()
                     > PREVIOUS_TRACK_RESTART_THRESHOLD.as_millis() as u64
                 {
+                    self.plays.seek();
                     self.controller.seek(Duration::ZERO).await;
                     self.signals
                         .update_progress(0, self.signals.duration_ms.get());
                 } else if let Some(prev_track) = self.queue.get_previous_track() {
+                    self.report_track_end(EndReason::BackSkip);
                     self.controller
-                        .play_track(prev_track, false, Duration::ZERO, false)
+                        .play_track(prev_track.clone(), false, Duration::ZERO, false)
                         .await;
+                    self.report_track_start(&prev_track, Duration::ZERO, false);
                 }
             }
             AudioMessage::PreviousTrack => {
                 if let Some(prev_track) = self.queue.get_previous_track() {
+                    self.report_track_end(EndReason::BackSkip);
                     self.controller
-                        .play_track(prev_track, false, Duration::ZERO, false)
+                        .play_track(prev_track.clone(), false, Duration::ZERO, false)
                         .await;
+                    self.report_track_start(&prev_track, Duration::ZERO, false);
                 }
             }
             AudioMessage::TrackEnded => {
                 self.on_track_ended().await;
             }
-            AudioMessage::Seek(dur) => self.controller.seek(dur).await,
+            AudioMessage::PreheatNext => {
+                // Re-peeking keeps a stale request after a skip or queue edit
+                // harmless; arming is idempotent and never blocks.
+                if let Some(next) = self.queue.peek_gapless_next() {
+                    self.controller.preheat_next(next);
+                }
+            }
+            AudioMessage::BoundaryCrossed => {
+                // The boundary watch thread fired at the sample-accurate end of
+                // the current source. A live firing arrives with the preheat
+                // still parked and the engine drained; claiming buffering first
+                // silences the monitor's empty-poll TrackEnded fallback for the
+                // rest of the advance (the swap clears it, play_track sets its
+                // own claim, the wave fetch keeps it). Stale firings — player
+                // stopped early by a skip/seek — see a non-empty engine or no
+                // preheat and are ignored here.
+                if self.controller.has_preheat() && self.controller.engine_is_empty() {
+                    let position_ms = self.signals.position_ms.get() as u128;
+                    let duration_ms = self.signals.duration_ms.get() as u128;
+                    let ended_early =
+                        duration_ms > 0 && position_ms.saturating_add(1_000) < duration_ms;
+                    if !ended_early {
+                        // Claim buffering for the whole advance: the queue
+                        // step may await a wave page fetch longer than the
+                        // monitor's swap grace, and a poll-fired TrackEnded
+                        // landing mid-advance would double-advance.
+                        self.signals.set_buffering(true);
+                        self.advance_queue(AdvanceReason::TrackEnded).await;
+                        return;
+                    }
+                    // The stream truncated mid-track with a preheat parked:
+                    // the ended-early reload path owns recovery, hand the
+                    // boundary over to it (play_track's stop drops the slot).
+                    self.controller.drop_preheat();
+                }
+            }
+            AudioMessage::Seek(dur, track_id) => {
+                // The id was captured at send time; a seek that raced an
+                // auto-advance or Next must not land on the new track.
+                if let Some(id) = track_id
+                    && self
+                        .signals
+                        .current_track_id
+                        .with(|cur| cur.as_deref() != Some(id.as_str()))
+                {
+                    tracing::debug!(track_id = %id, "seek_dropped_stale_track");
+                    return;
+                }
+                tracing::debug!(position_ms = dur.as_millis() as u64, "seek");
+                self.plays.seek();
+                self.controller.seek(dur).await;
+            }
             AudioMessage::SetVolume(vol) => self.controller.set_volume(vol as f32 / 100.0),
             AudioMessage::SetTransientVolumeGain(gain) => {
                 self.controller.set_transient_volume_gain(gain)
@@ -534,8 +741,35 @@ impl AudioSystem {
             AudioMessage::PlayTrackNext(track) => self.queue.play_next(track),
             AudioMessage::RemoveFromQueue(idx) => self.queue.remove_track(idx),
             AudioMessage::ClearQueue => self.queue.clear(),
-            AudioMessage::ToggleShuffle => self.queue.toggle_shuffle(),
-            AudioMessage::ToggleRepeatMode => self.queue.toggle_repeat_mode(),
+            AudioMessage::ReorderQueue(from, to) => self.queue.reorder(from, to),
+            AudioMessage::PlayQueueIndex(index) => self.play_queue_index(index).await,
+            // The wave queue is owned by the rotor session: shuffle/repeat
+            // would desync it from the server-side track stream, so both are
+            // disabled in a wave context (desktop-client parity).
+            AudioMessage::SetRepeatMode(mode) => {
+                if !self.queue.in_wave() {
+                    self.queue.set_repeat_mode(mode);
+                    self.persist_setting("repeat_mode", &repeat_mode_key(mode));
+                }
+            }
+            AudioMessage::SetShuffle(enabled) => {
+                if !self.queue.in_wave() {
+                    self.queue.set_shuffle(enabled);
+                    self.persist_setting("shuffle_enabled", &enabled);
+                }
+            }
+            AudioMessage::ToggleShuffle => {
+                if !self.queue.in_wave() {
+                    let enabled = self.queue.toggle_shuffle();
+                    self.persist_setting("shuffle_enabled", &enabled);
+                }
+            }
+            AudioMessage::ToggleRepeatMode => {
+                if !self.queue.in_wave() {
+                    let mode = self.queue.toggle_repeat_mode();
+                    self.persist_setting("repeat_mode", &repeat_mode_key(mode));
+                }
+            }
 
             AudioMessage::PlayPlaylist(kind) => {
                 let generation = self.begin_context_change();
@@ -558,24 +792,46 @@ impl AudioSystem {
                 });
             }
             AudioMessage::PlayAlbumTrack(aid, tid) => {
+                if self
+                    .try_jump_within_context(
+                        &system_loading::SingleTrackSource::AlbumTrack { album_id: aid },
+                        &tid,
+                    )
+                    .await
+                {
+                    return;
+                }
                 self.spawn_single_track_with_offline(
                     system_loading::SingleTrackSource::AlbumTrack { album_id: aid },
                     tid,
                 );
             }
             AudioMessage::PlayPlaylistTrack(kind, tid) => {
+                if self
+                    .try_jump_within_context(
+                        &system_loading::SingleTrackSource::PlaylistTrack { kind },
+                        &tid,
+                    )
+                    .await
+                {
+                    return;
+                }
                 self.spawn_single_track_with_offline(
                     system_loading::SingleTrackSource::PlaylistTrack { kind },
                     tid,
                 );
             }
             AudioMessage::PlayLikedTrack(tid) => {
-                self.spawn_single_track_with_offline(
-                    system_loading::SingleTrackSource::Liked,
-                    tid,
-                );
+                if self
+                    .try_jump_within_context(&system_loading::SingleTrackSource::Liked, &tid)
+                    .await
+                {
+                    return;
+                }
+                self.spawn_single_track_with_offline(system_loading::SingleTrackSource::Liked, tid);
             }
             AudioMessage::StartWave(seeds) => {
+                tracing::info!(seeds = seeds.len(), "wave_session_started");
                 let generation = self.begin_context_change();
                 let yandex = self.yandex.clone();
                 self.spawn_fetch_context(generation, move || async move {
@@ -632,7 +888,8 @@ impl AudioSystem {
                         let batch = self.queue.wave_batch_for_id(&track_id);
                         self.send_wave_feedback("dislike", Some(track_id), batch, None);
                         self.queue.refresh_wave_queue();
-                        self.play_next().await;
+                        self.advance_queue(AdvanceReason::Skipped(EndReason::Dislike))
+                            .await;
                     }
                 }
             }
@@ -650,19 +907,49 @@ impl AudioSystem {
                     }
                 }
             }
+            AudioMessage::BeginCrossfade => {
+                // The monitor reached the configured fade window with a
+                // preheat parked. The engine is NOT empty here (the old track
+                // still plays into the fade), so there is no empty-poll
+                // hazard and no buffering claim is needed. Mark the request
+                // so the unified advance promotes with an overlap, then clear
+                // it whatever the advance decided (a queue mismatch falls
+                // back to the cold path without a stale marker).
+                if self.controller.can_begin_crossfade() {
+                    self.controller.request_crossfade();
+                    self.advance_queue(AdvanceReason::TrackEnded).await;
+                    self.controller.clear_crossfade_request();
+                }
+            }
             AudioMessage::SetAudioDevice(device_name) => {
+                // Switch the engine first and commit the selection only on
+                // success: recreate_engine leaves the old stream running
+                // when the new device cannot open, and the settings UI
+                // must not show a device the engine is not using.
+                if let Err(e) = self.controller.recreate_engine(device_name.as_deref()).await {
+                    tracing::error!(error = %e, "audio_device_switch_failed");
+                    (self.error_sink)(format!("Failed to switch audio device: {e}"));
+                    // recreate_engine already stopped the old players (to wake
+                    // boundary watchers); the old stream is still alive, so
+                    // rebuild the source on it instead of leaving silence.
+                    self.reload_track().await;
+                    return;
+                }
+                let changed = self.signals.selected_device.get() != device_name;
                 self.signals.selected_device.set(device_name.clone());
+                if changed {
+                    tracing::info!(device = ?device_name, "audio_device_changed");
+                }
                 // Don't hold the actor on a DB write; persist in background.
-                let db = self.db.clone();
-                tokio::spawn(async move {
-                    let mut db = db.lock().await;
-                    let _ = db.save_setting("audio_device", &device_name).await;
-                });
-                self.recreate_stream().await;
+                self.persist_setting("audio_device", &device_name);
+                self.reload_track().await;
             }
             AudioMessage::RecreateStream => {
                 self.recreate_stream().await;
             }
+            // The actor loop breaks on this before dispatching; the arm
+            // exists only to keep the match exhaustive.
+            AudioMessage::Shutdown => {}
             AudioMessage::ReloadCurrentTrack => {
                 self.reload_track().await;
             }
@@ -674,18 +961,27 @@ impl AudioSystem {
     }
 
     async fn play_next(&mut self) {
-        self.advance_queue(AdvanceReason::Skipped).await;
+        self.advance_queue(AdvanceReason::Skipped(EndReason::Skip))
+            .await;
     }
 
     // Single advance path; reason selects wave_finish+get_next (natural end)
     // vs skip_wave/skip (user skip). Shared tail plays or auto-starts wave.
     async fn advance_queue(&mut self, reason: AdvanceReason) {
+        // Close the outgoing listen first: the position signals still belong
+        // to the outgoing track here.
+        let end_reason = match reason {
+            AdvanceReason::TrackEnded => EndReason::Finished,
+            AdvanceReason::Skipped(end_reason) => end_reason,
+        };
+        self.report_track_end(end_reason);
+
         let next = match reason {
             AdvanceReason::TrackEnded => {
                 self.queue.wave_finish_track();
                 self.queue.get_next_track().await
             }
-            AdvanceReason::Skipped => {
+            AdvanceReason::Skipped(_) => {
                 if self.queue.in_wave() {
                     self.queue.skip_wave_track().await
                 } else {
@@ -698,9 +994,22 @@ impl AudioSystem {
             if self.queue.in_wave() {
                 self.send_wave_track_started(&next_track);
             }
-            self.controller
-                .play_track(next_track, false, Duration::ZERO, false)
-                .await;
+            // A preheated swap keeps the audio pipeline intact across the
+            // boundary (gapless); with a pending crossfade request the
+            // outgoing track fades out over the overlap instead of being cut;
+            // anything else cold-starts the next track through play_track.
+            if self.controller.can_activate_preheat(&next_track.id) {
+                if self.controller.take_crossfade_request() {
+                    self.controller.begin_crossfade(next_track.clone());
+                } else {
+                    self.controller.activate_preheat(next_track.clone());
+                }
+            } else {
+                self.controller
+                    .play_track(next_track.clone(), false, Duration::ZERO, false)
+                    .await;
+            }
+            self.report_track_start(&next_track, Duration::ZERO, false);
         } else {
             // Queue ended, start "My Wave"
             let yandex = self.yandex.clone();
@@ -714,6 +1023,39 @@ impl AudioSystem {
         }
     }
 
+    // ---- `/plays` listening reports (server-side history) ----
+
+    // Wave batches are attributed per track like the desktop client.
+    fn report_track_start(&mut self, track: &Track, position: Duration, paused: bool) {
+        let mut ctx = self.queue.with_playback_context(PlayContext::from_playback);
+        if ctx.context == "radio"
+            && let Some(batch) = self.queue.wave_batch_for_track(track)
+        {
+            ctx.batch_id = Some(batch);
+        }
+        // `track.duration` wins: the duration signal may still carry the
+        // outgoing track's value.
+        let track_len = track
+            .duration
+            .unwrap_or_else(|| Duration::from_millis(self.signals.duration_ms.get()));
+        self.plays
+            .track_start(track, ctx, position, track_len, paused);
+    }
+
+    fn report_track_end(&mut self, reason: EndReason) {
+        let position = Duration::from_millis(self.signals.position_ms.get());
+        self.plays.track_end(reason, position);
+    }
+
+    fn report_pause(&mut self) {
+        let position = Duration::from_millis(self.signals.position_ms.get());
+        self.plays.pause(position);
+    }
+
+    fn report_resume(&mut self) {
+        self.plays.resume();
+    }
+
     fn send_wave_feedback(
         &self,
         feedback_type: &'static str,
@@ -721,35 +1063,46 @@ impl AudioSystem {
         batch_id: Option<String>,
         total_played: Option<Duration>,
     ) {
-        let session = match self.queue.wave_context() {
-            Some(s) => s,
-            None => return,
+        // Snapshot only the values the request needs: the session carries a
+        // whole page of tracks, so never clone it on this hot path.
+        let Some((terminated, usable, session_batch_id, radio_session_id, station_id, source_id)) =
+            self.queue.with_wave_session(|s| {
+                (
+                    s.terminated,
+                    is_usable_wave_session(s),
+                    s.batch_id.clone(),
+                    s.radio_session_id.clone(),
+                    s.station_id().to_string(),
+                    s.source_id().to_string(),
+                )
+            })
+        else {
+            return;
         };
         // Never send feedback for a dead session: without radio_session_id
         // the request goes to the user:onyourwave fallback URL with a foreign
         // batch_id (HTTP 400), and a terminated session is rejected too.
         // The session is repaired by preservation (fetcher) / recreate (queue).
-        if session.terminated || !is_usable_wave_session(&session) {
+        if terminated || !usable {
             tracing::error!(
                 feedback_type,
                 track_id = track_id.as_deref().unwrap_or("-"),
-                batch_id = %session.batch_id,
-                radio_session_id = session.radio_session_id.as_deref().unwrap_or("-"),
-                terminated = session.terminated,
+                batch_id = %session_batch_id,
+                radio_session_id = radio_session_id.as_deref().unwrap_or("-"),
+                terminated,
                 "wave_feedback_skipped_dead_session"
             );
             return;
         }
-        let station_id = session.station_id().to_string();
         // Per-track batch attribution like the original client; fall back to
         // the stored session batch for tracks served before per-track
         // mapping existed. `radioStarted` carries no batch.
         let batch_id = match (track_id.is_some(), batch_id) {
             (false, _) => None,
             (true, Some(batch)) => Some(batch),
-            (true, None) => Some(session.batch_id.clone()),
+            (true, None) => Some(session_batch_id),
         };
-        let from = Some(session.source_id().to_string());
+        let from = Some(source_id);
 
         let api = self.yandex.api.clone();
         tokio::spawn(async move {
@@ -773,7 +1126,14 @@ impl AudioSystem {
                     "wave_feedback_failed"
                 );
             } else {
-                tracing::info!(feedback_type, "wave_feedback_sent");
+                // Routine per-track protocol traffic: debug keeps the file log
+                // readable while failures still surface as warn above.
+                tracing::debug!(
+                    feedback_type,
+                    track_id = track_id.as_deref().unwrap_or("-"),
+                    batch_id = batch_id.as_deref().unwrap_or("-"),
+                    "wave_feedback_sent"
+                );
             }
         });
     }
@@ -820,7 +1180,8 @@ impl AudioSystem {
     pub async fn send_wave_dislike_skip(&mut self, track: &Track) {
         self.send_wave_track_with_post("dislike", track, WavePostAction::Refresh);
 
-        self.play_next().await;
+        self.advance_queue(AdvanceReason::Skipped(EndReason::Dislike))
+            .await;
     }
 
     pub fn send_wave_undislike(&mut self, track: &Track) {
@@ -841,7 +1202,7 @@ impl AudioSystem {
             Ok(outcome) => {
                 let (new_revision, count, ids) = match outcome {
                     LikedTracksSync::Unchanged => {
-                        tracing::debug!("Liked tracks unchanged (revision {:?})", revision);
+                        tracing::debug!(revision = ?revision, "liked_tracks_unchanged");
                         return;
                     }
                     LikedTracksSync::Changed {
@@ -869,21 +1230,34 @@ impl AudioSystem {
                 };
 
                 let mut db = db_arc.lock().await;
-                let _ = db.save_liked_tracks(&ids).await;
-                let _ = db.save_setting("liked_tracks_revision", &new_revision).await;
+                // The revision must only advance when the liked save landed,
+                // or the next revision-gated sync would skip the missing ids.
+                match db.save_liked_tracks(&ids).await {
+                    Ok(()) => {
+                        if let Err(e) = db
+                            .save_setting("liked_tracks_revision", &new_revision)
+                            .await
+                        {
+                            tracing::error!(error = ?e, "persist_liked_tracks_revision_failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = ?e, "persist_liked_tracks_failed");
+                    }
+                }
                 drop(db);
 
                 signals.library_changed.send_replace(());
 
                 tracing::info!(
-                    "Synced {} liked track IDs (revision {:?} -> {})",
                     count,
-                    revision,
-                    new_revision
+                    old_revision = ?revision,
+                    new_revision = ?new_revision,
+                    "liked_tracks_synced_collection"
                 );
             }
             Err(e) => {
-                tracing::warn!("Liked collection sync failed: {:?}", e);
+                tracing::warn!(error = ?e, "liked_collection_sync_failed");
                 // Legacy fallback (servers without collection/sync): full pull.
                 // No revision comes back, so the next sync retries the gated path.
                 match api.fetch_liked_ids().await {
@@ -895,13 +1269,15 @@ impl AudioSystem {
                         }
                         let liked_ids = state.read().await.liked.ordered_snapshot().0;
                         let mut db = db_arc.lock().await;
-                        let _ = db.save_liked_tracks(&liked_ids).await;
+                        if let Err(e) = db.save_liked_tracks(&liked_ids).await {
+                            tracing::error!(error = ?e, "persist_liked_tracks_failed");
+                        }
                         drop(db);
                         signals.library_changed.send_replace(());
-                        tracing::info!("Synced {} liked track IDs (fallback full pull)", count);
+                        tracing::info!(count, "liked_tracks_synced_full_pull");
                     }
                     Err(e) => {
-                        tracing::warn!("Liked fallback pull failed, keeping cache: {:?}", e);
+                        tracing::warn!(error = ?e, "liked_fallback_pull_failed");
                     }
                 }
             }

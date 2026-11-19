@@ -20,12 +20,13 @@ pub struct EffectChain {
     slots: Vec<EffectSlot>,
     handles: HashMap<String, EffectHandle>,
     channels: usize,
+    sample_rate: u32,
     left: Vec<f32>,
     right: Vec<f32>,
 }
 
 impl EffectChain {
-    pub fn new(channels: u16, _sample_rate: u32) -> Self {
+    pub fn new(channels: u16, sample_rate: u32) -> Self {
         // Preallocate scratch buffers outside the realtime callback
         // to avoid heap allocation in process_block hot path.
         const INITIAL_FRAMES: usize = 2048;
@@ -33,6 +34,7 @@ impl EffectChain {
             slots: Vec::new(),
             handles: HashMap::new(),
             channels: channels as usize,
+            sample_rate,
             left: vec![0.0; INITIAL_FRAMES],
             right: vec![0.0; INITIAL_FRAMES],
         }
@@ -66,7 +68,7 @@ impl EffectChain {
             params: params.clone(),
         };
 
-        self.handles.insert(id_str.clone(), handle.clone());
+        self.handles.insert(id_str, handle.clone());
         self.slots.push(EffectSlot { effect, params });
 
         handle
@@ -113,10 +115,10 @@ impl EffectChain {
 
         if ch == 1 {
             // Mono: run effects on duplicated mono so monitor/fade/FX keep working.
-            for i in 0..frames {
-                let m = buffer[i];
-                self.left[i] = m;
-                self.right[i] = m;
+            let (left, right) = (&mut self.left[..frames], &mut self.right[..frames]);
+            for ((m, l), r) in buffer[..frames].iter().zip(left).zip(right) {
+                *l = *m;
+                *r = *m;
             }
 
             for slot in &mut self.slots {
@@ -126,8 +128,12 @@ impl EffectChain {
                 }
             }
 
-            for i in 0..frames {
-                buffer[i] = 0.5 * (self.left[i] + self.right[i]);
+            for ((m, l), r) in buffer[..frames]
+                .iter_mut()
+                .zip(&self.left[..frames])
+                .zip(&self.right[..frames])
+            {
+                *m = 0.5 * (l + r);
             }
             return;
         }
@@ -153,9 +159,11 @@ impl EffectChain {
         }
     }
 
-    pub fn seek(&mut self, _pos: Duration) {
+    pub fn seek(&mut self, pos: Duration) {
+        // Forward the absolute position: a blind reset would replay a track's
+        // fade-in ramp from the seek point and misplace the fade-out.
         for slot in &mut self.slots {
-            slot.effect.reset();
+            slot.effect.seek(pos, self.sample_rate);
         }
     }
 
@@ -196,12 +204,7 @@ mod tests {
             unit: "",
         }]));
         params.set_enabled(enabled);
-        chain.add_effect(
-            "gain",
-            "Gain",
-            Box::new(GainEffect { gain }),
-            params,
-        );
+        chain.add_effect("gain", "Gain", Box::new(GainEffect { gain }), params);
         chain
     }
 
@@ -247,5 +250,30 @@ mod tests {
         let mut buf = vec![0.25, 0.5, 0.75, 1.0];
         chain.process_block(&mut buf, 4);
         assert_eq!(buf, vec![0.5, 1.0, 0.75, 1.0]);
+    }
+
+    #[test]
+    fn seek_positions_fade_effects_through_the_chain() {
+        // Regression: chain.seek used to blind-reset every effect, so a
+        // mid-track seek replayed the fade-in ramp from frame 0.
+        use super::super::modules::FadeEffect;
+
+        let mut chain = EffectChain::new(2, 48000);
+        let params = Arc::new(EffectParams::new(&[]));
+        params.set_enabled(true);
+        chain.add_effect(
+            "fade",
+            "Fade",
+            Box::new(FadeEffect::new(0.0, 1.0, 100.0, 101.0, 48000, 2)),
+            params,
+        );
+
+        chain.seek(Duration::from_secs(50));
+        let mut buf = vec![1.0f32; 8];
+        chain.process_block(&mut buf, 8);
+        assert!(
+            buf.iter().all(|&v| v == 1.0),
+            "mid-track seek must play at full gain, got {buf:?}"
+        );
     }
 }

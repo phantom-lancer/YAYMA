@@ -1,4 +1,3 @@
-use super::migration::{merge_foreign_tables, stash_foreign_tables};
 use crate::api::models::{AppError, TrackArtistDto};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
@@ -12,6 +11,10 @@ type DbResult<T> = Result<T, AppError>;
 /// Default TTL for cached images: 7 days in seconds
 pub(crate) const DEFAULT_CACHE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
+/// Synchronous SQLite on an async runtime. Every method takes `&mut self`, so
+/// callers already serialize on one `tokio::sync::Mutex`. Full-table scans and
+/// bulk transactions are wrapped in `block_in_place` so they do not hold a
+/// worker thread hostage; single-row statements are short enough to run inline.
 pub struct AppDatabase {
     conn: Connection,
 }
@@ -66,19 +69,36 @@ const CREATE_TRACK_ARTISTS: &str = "CREATE TABLE IF NOT EXISTS track_metadata_ar
     FOREIGN KEY (track_id) REFERENCES track_metadata(track_id) ON DELETE CASCADE
 )";
 
+/// Indexes the queries above actually use: `prune_cache` orders by
+/// `last_access_at`, `prune_expired` filters on `expires_at`.
 const CREATE_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_cache_last_access ON cache_metadata(last_access_at)",
     "CREATE INDEX IF NOT EXISTS idx_cache_expires_at ON cache_metadata(expires_at)",
-    "CREATE INDEX IF NOT EXISTS idx_track_artists_id ON track_metadata_artists(track_id)",
-    "CREATE INDEX IF NOT EXISTS idx_track_artists_name ON track_metadata_artists(name)",
-    "CREATE INDEX IF NOT EXISTS idx_metadata_search_title ON track_metadata(title)",
 ];
+
+/// Indexes from earlier schema versions that no query can use, dropped so
+/// existing databases stop paying for them on every write:
+/// - `idx_track_artists_id` is the prefix of the `(track_id, position)`
+///   primary key;
+/// - nothing filters on artist name or title in SQL (both searches run in
+///   memory over a snapshot).
+const DROP_INDEXES: &[&str] = &[
+    "DROP INDEX IF EXISTS idx_track_artists_id",
+    "DROP INDEX IF EXISTS idx_track_artists_name",
+    "DROP INDEX IF EXISTS idx_metadata_search_title",
+];
+
+/// A cached HTTP response. `expired` means the TTL ran out and the file must
+/// be re-fetched.
+pub struct CachedFile {
+    pub path: String,
+    pub expired: bool,
+}
 
 impl AppDatabase {
     pub async fn init(base_path: Option<PathBuf>) -> DbResult<Self> {
-        // Sync SQLite I/O (open + one-time migration) must not stall the executor.
+        // Sync SQLite I/O (open + schema creation) must not stall the executor.
         tokio::task::block_in_place(|| {
-            // Same file the toasty backend used, so in-place migration is possible.
             let db_path = if let Some(path) = base_path {
                 std::fs::create_dir_all(&path).ok();
                 path.join("yamusic_v2.db")
@@ -101,10 +121,6 @@ impl AppDatabase {
             conn.pragma_update(None, "temp_store", "MEMORY")?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
 
-            // Phase 1: move foreign tables aside so CREATE below can't
-            // silently reuse a wrong schema under our names.
-            stash_foreign_tables(&conn);
-
             for m in [
                 CREATE_APP_SETTINGS,
                 CREATE_LIKED_TRACKS,
@@ -117,72 +133,12 @@ impl AppDatabase {
             for idx in CREATE_INDEXES {
                 conn.execute(idx, [])?;
             }
+            for idx in DROP_INDEXES {
+                conn.execute(idx, [])?;
+            }
 
-            // Phase 3: merge the stashed leftovers into the fresh schema.
-            merge_foreign_tables(&conn);
-
-            let mut db = Self { conn };
-            db.import_liked_from_settings();
-            Ok(db)
+            Ok(Self { conn })
         })
-    }
-
-    /// One-time import: toasty kept liked tracks as a JSON array in settings.
-    /// Moves them into the dedicated table, then removes the key.
-    fn import_liked_from_settings(&mut self) {
-        let raw: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT value FROM app_settings WHERE key = 'liked_tracks'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()
-            .unwrap_or(None)
-            .flatten();
-        let Some(raw) = raw else { return };
-        let ids: Vec<String> = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("Failed to parse legacy liked_tracks setting: {}", e);
-                return;
-            }
-        };
-        if ids.is_empty() {
-            let _ = self
-                .conn
-                .execute("DELETE FROM app_settings WHERE key = 'liked_tracks'", []);
-            return;
-        }
-        let tx = match self.conn.transaction() {
-            Ok(tx) => tx,
-            Err(e) => {
-                tracing::warn!("Liked tracks import failed: {}", e);
-                return;
-            }
-        };
-        let mut ok = true;
-        for id in &ids {
-            if tx
-                .execute(
-                    "INSERT OR IGNORE INTO liked_tracks (track_id) VALUES (?1)",
-                    params![id],
-                )
-                .is_err()
-            {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            ok = tx
-                .execute("DELETE FROM app_settings WHERE key = 'liked_tracks'", [])
-                .is_ok()
-                && tx.commit().is_ok();
-        }
-        if !ok {
-            tracing::warn!("Liked tracks import failed, keeping settings copy");
-        }
     }
 
     pub async fn save_auth_token(&mut self, token: &str, user_id: u64) -> DbResult<()> {
@@ -206,7 +162,7 @@ impl AppDatabase {
                 {
                     return Ok(Some((tok.to_string(), uid)));
                 }
-                tracing::warn!("Unrecognized auth_token format, dropping");
+                tracing::warn!("unrecognized_auth_token_format_dropped");
                 Ok(None)
             }
         }
@@ -247,31 +203,28 @@ impl AppDatabase {
         Ok(())
     }
 
-    pub async fn get_cache_metadata(
-        &mut self,
-        url: &str,
-    ) -> DbResult<Option<(String, Option<String>, bool)>> {
-        let row: Option<(String, Option<String>, i64)> = self
+    pub async fn get_cache_metadata(&mut self, url: &str) -> DbResult<Option<CachedFile>> {
+        let row: Option<(String, i64)> = self
             .conn
             .query_row(
-                "SELECT file_path, etag, expires_at FROM cache_metadata WHERE url = ?1",
+                "SELECT file_path, expires_at FROM cache_metadata WHERE url = ?1",
                 params![url],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
         match row {
             None => Ok(None),
-            Some((path, etag, expires_at)) => {
+            Some((path, expires_at)) => {
                 let now = chrono::Utc::now().timestamp();
-                let is_expired = now >= expires_at;
-                if !is_expired {
+                let expired = now >= expires_at;
+                if !expired {
                     let new_expires = now + DEFAULT_CACHE_TTL_SECS;
                     let _ = self.conn.execute(
                         "UPDATE cache_metadata SET last_access_at = ?1, expires_at = ?2 WHERE url = ?3",
                         params![now, new_expires, url],
                     );
                 }
-                Ok(Some((path, etag, is_expired)))
+                Ok(Some(CachedFile { path, expired }))
             }
         }
     }
@@ -332,11 +285,10 @@ impl AppDatabase {
                     .execute("DELETE FROM cache_metadata WHERE url = ?1", params![url])
                 {
                     Ok(1..) => paths.push(path),
-                    Ok(0) => tracing::warn!(
-                        "prune_cache: row already gone for {}, keeping file list consistent",
-                        url
-                    ),
-                    Err(e) => tracing::warn!("prune_cache: failed to delete {}: {}", url, e),
+                    Ok(0) => tracing::warn!(url = %url, "prune_cache_row_already_gone"),
+                    Err(e) => {
+                        tracing::warn!(url = %url, error = %e, "prune_cache_delete_failed")
+                    }
                 }
             }
             Ok(paths)
@@ -382,25 +334,31 @@ impl AppDatabase {
     }
 
     pub async fn save_liked_tracks(&mut self, track_ids: &[String]) -> DbResult<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM liked_tracks", [])?;
-        {
-            let mut stmt =
-                tx.prepare("INSERT OR IGNORE INTO liked_tracks (track_id) VALUES (?1)")?;
-            for id in track_ids {
-                stmt.execute(params![id])?;
+        // Bulk delete + N inserts: long enough to keep off the async executor.
+        tokio::task::block_in_place(|| {
+            let tx = self.conn.transaction()?;
+            tx.execute("DELETE FROM liked_tracks", [])?;
+            {
+                let mut stmt =
+                    tx.prepare("INSERT OR IGNORE INTO liked_tracks (track_id) VALUES (?1)")?;
+                for id in track_ids {
+                    stmt.execute(params![id])?;
+                }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     pub async fn load_liked_tracks(&mut self) -> DbResult<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT track_id FROM liked_tracks")?;
-        let ids: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(ids)
+        // Full-table scan: same reason as the bulk write above.
+        tokio::task::block_in_place(|| {
+            let mut stmt = self.conn.prepare("SELECT track_id FROM liked_tracks")?;
+            let ids: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(ids)
+        })
     }
 
     pub async fn add_liked_track(&mut self, track_id: &str) -> DbResult<()> {
@@ -419,43 +377,56 @@ impl AppDatabase {
         Ok(())
     }
 
-    pub async fn upsert_track_metadata(&mut self, metadata: TrackMetadata) -> DbResult<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO track_metadata (track_id, title, version, album, album_id, cover_url, duration_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(track_id) DO UPDATE SET
-             title = excluded.title,
-             version = excluded.version,
-             album = excluded.album,
-             album_id = excluded.album_id,
-             cover_url = excluded.cover_url,
-             duration_ms = excluded.duration_ms",
-            params![
-                metadata.id,
-                metadata.title,
-                metadata.version,
-                metadata.album,
-                metadata.album_id,
-                metadata.cover_url,
-                metadata.duration_ms as i64
-            ],
-        )?;
-        tx.execute(
-            "DELETE FROM track_metadata_artists WHERE track_id = ?1",
-            params![metadata.id],
-        )?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO track_metadata_artists (track_id, artist_id, name, position)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (i, artist) in metadata.artists.into_iter().enumerate() {
-                stmt.execute(params![metadata.id, artist.id, artist.name, i as i64])?;
-            }
+    /// Inserts or updates many tracks in one transaction.
+    ///
+    /// Seeded from playlist syncs, where the per-track version paid a
+    /// transaction, three statement preparations and a `clone()` per track.
+    /// All-or-nothing: on failure the previous rows stay and the next sync
+    /// retries. These rows cache server data, so a lost batch costs nothing.
+    pub async fn upsert_track_metadata(&mut self, items: &[TrackMetadata]) -> DbResult<()> {
+        if items.is_empty() {
+            return Ok(());
         }
-        tx.commit()?;
-        Ok(())
+        // Bulk write: keep off the async executor.
+        tokio::task::block_in_place(|| {
+            let tx = self.conn.transaction()?;
+            {
+                let mut upsert = tx.prepare(
+                    "INSERT INTO track_metadata (track_id, title, version, album, album_id, cover_url, duration_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(track_id) DO UPDATE SET
+                     title = excluded.title,
+                     version = excluded.version,
+                     album = excluded.album,
+                     album_id = excluded.album_id,
+                     cover_url = excluded.cover_url,
+                     duration_ms = excluded.duration_ms",
+                )?;
+                let mut clear_artists =
+                    tx.prepare("DELETE FROM track_metadata_artists WHERE track_id = ?1")?;
+                let mut insert_artist = tx.prepare(
+                    "INSERT INTO track_metadata_artists (track_id, artist_id, name, position)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?;
+                for m in items {
+                    upsert.execute(params![
+                        m.id,
+                        m.title,
+                        m.version,
+                        m.album,
+                        m.album_id,
+                        m.cover_url,
+                        m.duration_ms as i64
+                    ])?;
+                    clear_artists.execute(params![m.id])?;
+                    for (i, artist) in m.artists.iter().enumerate() {
+                        insert_artist.execute(params![m.id, artist.id, artist.name, i as i64])?;
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     pub async fn get_track_metadata(
@@ -554,13 +525,13 @@ impl AppDatabase {
         key: &str,
         value: &T,
     ) -> DbResult<()> {
-        match serde_json::to_string(value) {
-            Ok(val) => self.save_app_setting(key, &val).await,
-            Err(e) => {
-                tracing::error!("Failed to serialize setting '{}': {}", key, e);
-                Ok(())
-            }
-        }
+        // A failed serialization means the setting was NOT saved; reporting
+        // success would silently revert it on the next launch.
+        let val = serde_json::to_string(value).map_err(|e| {
+            tracing::error!(key = %key, error = %e, "serialize_setting_failed");
+            AppError::DbError(format!("serialize setting {key}: {e}"))
+        })?;
+        self.save_app_setting(key, &val).await
     }
 
     pub async fn load_setting<T: serde::de::DeserializeOwned>(
@@ -572,7 +543,7 @@ impl AppDatabase {
             Some(v) => match serde_json::from_str(&v) {
                 Ok(parsed) => Ok(Some(parsed)),
                 Err(e) => {
-                    tracing::warn!("Failed to parse setting '{}': {}", key, e);
+                    tracing::warn!(key = %key, error = %e, "parse_setting_failed");
                     Ok(None)
                 }
             },
@@ -613,5 +584,78 @@ impl AppDatabase {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(id: &str, artists: &[(&str, &str)]) -> TrackMetadata {
+        TrackMetadata {
+            id: id.to_string(),
+            title: format!("title {id}"),
+            version: None,
+            artists: artists
+                .iter()
+                .map(|(artist_id, name)| TrackArtistDto {
+                    id: artist_id.to_string(),
+                    name: name.to_string(),
+                })
+                .collect(),
+            album: None,
+            album_id: None,
+            cover_url: None,
+            duration_ms: 1000,
+        }
+    }
+
+    // `block_in_place` panics on the current-thread runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_upsert_replaces_artists_and_keeps_their_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "yayma-db-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after unix epoch")
+                .as_nanos()
+        ));
+        let mut db = AppDatabase::init(Some(dir.clone())).await.expect("init db");
+
+        db.upsert_track_metadata(&[
+            track("a", &[("1", "First"), ("2", "Second")]),
+            track("b", &[("3", "Solo")]),
+        ])
+        .await
+        .expect("first batch");
+
+        // Re-upserting a track must replace its artists, not append to them.
+        db.upsert_track_metadata(&[track("a", &[("4", "Replacement")])])
+            .await
+            .expect("second batch");
+
+        let rows = db
+            .get_track_metadata(&["a".to_string(), "b".to_string()])
+            .await
+            .expect("read back");
+
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"], "requested order is preserved");
+        assert_eq!(rows[0].artists.len(), 1);
+        assert_eq!(rows[0].artists[0].name, "Replacement");
+        assert_eq!(rows[1].artists[0].name, "Solo");
+
+        db.upsert_track_metadata(&[track("a", &[("1", "One"), ("2", "Two")])])
+            .await
+            .expect("third batch");
+        let rows = db
+            .get_track_metadata(&["a".to_string()])
+            .await
+            .expect("read back");
+        let names: Vec<&str> = rows[0].artists.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["One", "Two"], "artist position follows the input");
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

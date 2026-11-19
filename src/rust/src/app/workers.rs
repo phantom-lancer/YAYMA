@@ -27,12 +27,10 @@ pub fn spawn_bridge_worker(ctx: AppContext, mut shutdown_rx: watch::Receiver<boo
 
         // Send initial state
         {
-            let (liked, disliked) = audio_state.read().await.liked.snapshot();
-            let state = crate::api::playback::get_playback_state_internal(
-                &audio_signals,
-                &liked,
-                &disliked,
-            );
+            let state = {
+                let audio = audio_state.read().await;
+                crate::api::playback::get_playback_state_internal(&audio_signals, &audio.liked)
+            };
             ctx.send_event(AppEvent::PlaybackStateChanged(state));
 
             ctx.send_event(AppEvent::PlaybackProgress(
@@ -56,8 +54,10 @@ pub fn spawn_bridge_worker(ctx: AppContext, mut shutdown_rx: watch::Receiver<boo
                 }
                 res = changed_rx.changed() => {
                     if res.is_err() { break; }
-                    let (liked, disliked) = audio_state.read().await.liked.snapshot();
-                    let state = crate::api::playback::get_playback_state_internal(&audio_signals, &liked, &disliked);
+                    let state = {
+                        let audio = audio_state.read().await;
+                        crate::api::playback::get_playback_state_internal(&audio_signals, &audio.liked)
+                    };
                     ctx.send_event(AppEvent::PlaybackStateChanged(state));
 
                     // Save state when is_playing changes (play/pause)
@@ -82,10 +82,11 @@ pub fn spawn_bridge_worker(ctx: AppContext, mut shutdown_rx: watch::Receiver<boo
                     }));
                 }
                 _ = vibe_interval.tick() => {
-                    // Shader is disabled — skip tick computation entirely
+                    // Shader is disabled or the window cannot show it (minimized /
+                    // hidden to tray) — skip tick computation entirely
                     // (VibeEngine::tick + event dispatch), instead of merely
                     // dropping it on the Dart side.
-                    if !audio_signals.vibe_enabled.get() {
+                    if !audio_signals.vibe_enabled.get() || vibe_window_hidden() {
                         continue;
                     }
                     let is_playing = audio_signals.is_playing.get();
@@ -121,6 +122,39 @@ pub fn spawn_bridge_worker(ctx: AppContext, mut shutdown_rx: watch::Receiver<boo
     });
 }
 
+/// True while the app window is minimized or hidden (close-to-tray), where the
+/// vibe shader cannot be seen and its 30 Hz tick is wasted work.
+#[cfg(target_os = "windows")]
+fn vibe_window_hidden() -> bool {
+    use std::sync::OnceLock;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
+
+    static HWND_RAW: OnceLock<isize> = OnceLock::new();
+    // Enumerating windows is too heavy for 30 Hz; resolve the handle once.
+    // Retry until found in case the first ticks land before window creation.
+    let raw = match HWND_RAW.get() {
+        Some(&raw) => raw,
+        None => {
+            let Some(hwnd) = crate::audio::thumbnail::get_flutter_hwnd() else {
+                return false;
+            };
+            let raw = hwnd.0 as isize;
+            let _ = HWND_RAW.set(raw);
+            raw
+        }
+    };
+    let hwnd = HWND(raw as *mut _);
+    // SAFETY: `raw` came from `get_flutter_hwnd`; both queries accept a stale or
+    // foreign handle and report it as not-iconic/not-visible rather than fault.
+    unsafe { IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn vibe_window_hidden() -> bool {
+    false
+}
+
 pub fn spawn_settings_worker(ctx: AppContext, mut shutdown_rx: watch::Receiver<bool>) {
     tokio::spawn(async move {
         loop {
@@ -148,14 +182,20 @@ pub fn spawn_settings_worker(ctx: AppContext, mut shutdown_rx: watch::Receiver<b
 
                     let mut db = ctx.core.db.lock().await;
 
-                    if let Some(bands) = eq_bands {
-                        let _ = db.save_equalizer(eq_enabled, &bands).await;
+                    if let Some(bands) = eq_bands
+                        && let Err(e) = db.save_equalizer(eq_enabled, &bands).await
+                    {
+                        tracing::error!(error = ?e, "persist_equalizer_failed");
                     }
 
-                    let _ = db.save_setting("audio_quality", &quality).await;
+                    if let Err(e) = db.save_setting("audio_quality", &quality).await {
+                        tracing::error!(error = ?e, "persist_audio_quality_failed");
+                    }
 
                     for (id, enabled, params) in effects {
-                        let _ = db.save_effect(&id, enabled, &params).await;
+                        if let Err(e) = db.save_effect(&id, enabled, &params).await {
+                            tracing::error!(effect_id = %id, error = ?e, "persist_effect_failed");
+                        }
                     }
                 }
                 _ = shutdown_rx.changed() => {

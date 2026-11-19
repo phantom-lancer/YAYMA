@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
@@ -59,8 +60,7 @@ class _SearchViewState extends State<SearchView> {
         // No subscription while the tab is hidden; results arriving in
         // the background don't rebuild it, they are picked up on open.
         final searchResultsAsync = visibleSignal(context, searchResultsSignal);
-        final screenWidth = MediaQuery.sizeOf(context).width;
-        final isNarrow = screenWidth < 600;
+        final isNarrow = context.isNarrow;
         final results = searchResultsAsync.value;
         final noResults =
             results != null &&
@@ -73,7 +73,10 @@ class _SearchViewState extends State<SearchView> {
         final Widget? placeholder = searchResultsAsync.isLoading
             ? const CommonLoadingWidget()
             : searchResultsAsync.hasError
-            ? CommonErrorWidget(error: searchResultsAsync.error!)
+            ? CommonErrorWidget(
+                error: searchResultsAsync.error!,
+                onRetry: requestGlobalRefresh,
+              )
             : results == null
             ? const _EmptySearchState()
             : noResults
@@ -99,9 +102,11 @@ class _SearchViewState extends State<SearchView> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const CommonPageTitle(title: 'Поиск'),
-                        if (!isNarrow) const SizedBox(height: 24),
-                        if (isNarrow) const SizedBox(height: 8),
+                        if (!Platform.isAndroid) ...[
+                          const CommonPageTitle(title: 'Поиск'),
+                          if (!isNarrow) const SizedBox(height: 24),
+                          if (isNarrow) const SizedBox(height: 8),
+                        ],
                         TextField(
                           controller: _controller,
                           onChanged: setSearchQuery,
@@ -306,8 +311,8 @@ class _TrackSearchTile extends StatelessWidget {
           icon: Icon(
             Icons.add_rounded,
             color: Theme.of(context).colorScheme.onSurfaceVariant,
+            semanticLabel: 'Добавить в плейлист',
           ),
-          tooltip: 'Добавить в плейлист',
           onPressed: () => AddToPlaylistDialog.show(context, track),
         ),
       ],

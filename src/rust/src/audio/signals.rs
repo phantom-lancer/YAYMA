@@ -25,13 +25,21 @@ pub struct AudioSignals {
     pub volume: Signal<u8>,
     pub is_muted: Signal<bool>,
     pub queue: Signal<Vector<Track>>,
-    pub history: Signal<Vector<Track>>,
     pub queue_index: Signal<usize>,
     pub queue_length: Signal<usize>,
+    /// Bumped on every queue replacement/reorder so the UI can tell two
+    /// same-length queues apart (queue length alone does not change).
+    pub queue_revision: Signal<u32>,
     pub repeat_mode: Signal<RepeatMode>,
     pub is_shuffled: Signal<bool>,
     pub current_wave_seeds: Signal<Vec<String>>,
-    pub amplitude: Signal<f32>,
+    /// Projection of the active playback context, kept in sync with
+    /// QueueManager's playback_context (and the wave extension path).
+    pub playback_context: Signal<Option<crate::api::models::PlaybackContextDto>>,
+    /// Crossfade length in milliseconds (0 = strict gapless without overlap).
+    /// Written by the settings API (and the startup loader), read by the
+    /// controller's monitor trigger and the crossfade path.
+    pub crossfade_ms: Signal<u32>,
     pub codec: Signal<Option<String>>,
     pub discord_rpc: Signal<bool>,
     pub selected_device: Signal<Option<String>>,
@@ -49,6 +57,10 @@ pub struct AudioSignals {
     pub progress_changed: watch::Sender<u32>,
     pub progress_rx: watch::Receiver<u32>,
 }
+
+/// Overlap window used when the crossfade toggle is on and a track has no
+/// server fade region of its own. Not user-configurable.
+pub const USER_CROSSFADE_MS: u32 = 6_000;
 
 impl AudioSignals {
     pub fn new() -> Self {
@@ -70,13 +82,14 @@ impl AudioSignals {
             volume: Signal::new(100),
             is_muted: Signal::new(false),
             queue: Signal::new(Vector::new()),
-            history: Signal::new(Vector::new()),
             queue_index: Signal::new(0),
             queue_length: Signal::new(0),
+            queue_revision: Signal::new(0),
             repeat_mode: Signal::new(RepeatMode::None),
             is_shuffled: Signal::new(false),
             current_wave_seeds: Signal::new(Vec::new()),
-            amplitude: Signal::new(0.0),
+            playback_context: Signal::new(None),
+            crossfade_ms: Signal::new(0),
             codec: Signal::new(None),
             discord_rpc: Signal::new(false),
             selected_device: Signal::new(None),
@@ -103,9 +116,10 @@ impl AudioSignals {
             ));
             self.current_track_id.set(Some(t.id.clone()));
 
-            if let Some(duration) = t.duration {
-                self.duration_ms.set(duration.as_millis() as u64);
-            }
+            // 0 = unknown: a duration-less track must not inherit the
+            // previous track's value (a natural end would read as ended-early).
+            self.duration_ms
+                .set(t.duration.map_or(0, |d| d.as_millis() as u64));
             self.is_stopped.set(false);
         } else {
             self.title.set(None);
@@ -141,11 +155,12 @@ impl AudioSignals {
         self.buffered_ratio.set(ratio.clamp(0.0, 1.0));
     }
 
-    pub fn set_queue(&self, queue: Vector<Track>, history: Vector<Track>, index: usize) {
+    pub fn set_queue(&self, queue: Vector<Track>, index: usize) {
         self.queue.set(queue.clone());
-        self.history.set(history);
         self.queue_index.set(index);
         self.queue_length.set(queue.len());
+        self.queue_revision
+            .update(|revision| *revision = revision.wrapping_add(1));
         self.changed.send_replace(());
     }
 
@@ -162,11 +177,6 @@ impl AudioSignals {
 
     pub fn set_shuffled(&self, shuffled: bool) {
         self.is_shuffled.set(shuffled);
-        self.changed.send_replace(());
-    }
-
-    pub fn set_history(&self, history: Vector<Track>) {
-        self.history.set(history);
         self.changed.send_replace(());
     }
 
@@ -189,5 +199,39 @@ impl AudioSignals {
 impl Default for AudioSignals {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_queue_bumps_revision() {
+        let signals = AudioSignals::new();
+        assert_eq!(signals.queue_revision.get(), 0);
+
+        signals.set_queue(Vector::new(), 0);
+        assert_eq!(signals.queue_revision.get(), 1);
+
+        // A same-length replacement must still be observable.
+        signals.set_queue(Vector::new(), 0);
+        assert_eq!(signals.queue_revision.get(), 2);
+    }
+
+    #[test]
+    fn durationless_track_resets_stale_duration() {
+        let signals = AudioSignals::new();
+        let with_duration: Track = serde_json::from_value(
+            serde_json::json!({ "id": "1", "realId": "1", "durationMs": 213_000 }),
+        )
+        .expect("test track JSON must deserialize");
+        signals.set_current_track(Some(with_duration));
+        assert_eq!(signals.duration_ms.get(), 213_000);
+
+        // The next track carries no duration: the old value must not leak
+        // (a stale one makes a natural end classify as ended_early).
+        signals.set_current_track(Some(crate::util::track::test_track("2")));
+        assert_eq!(signals.duration_ms.get(), 0);
     }
 }

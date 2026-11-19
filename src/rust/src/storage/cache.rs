@@ -1,4 +1,5 @@
 use crate::db::AppDatabase;
+use crate::util::tls::USER_AGENT;
 use directories::ProjectDirs;
 use foldhash::HashMap;
 use foldhash::HashMapExt;
@@ -12,6 +13,62 @@ use tokio::fs;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 
+/// How long a follower waits for the download it joined, and how long the
+/// downloader itself may run. The follower's budget is longer on purpose: it
+/// also has to cover the downloader's own timeout.
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const DOWNLOAD_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Waits for the in-flight download of a URL.
+///
+/// Three failures can happen at once here — the downloader timed out, the
+/// broadcast channel died, or the payload says the download failed — so each
+/// `?` turns one layer into a flat error instead of nesting matches.
+async fn await_download(
+    rx: &mut broadcast::Receiver<Result<PathBuf, String>>,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let received = tokio::time::timeout(DOWNLOAD_WAIT_TIMEOUT, rx.recv())
+        .await
+        .map_err(|_| "timed out waiting for the http cache download")?;
+    let outcome = received.map_err(|e| format!("http cache download channel closed: {e}"))?;
+    outcome.map_err(Into::into)
+}
+
+/// Streams the body into `path`, returning the bytes actually written.
+///
+/// The byte count is what landed on disk, not `Content-Length` (which counts
+/// the untouched body and ignores any transfer decoding), so the cache quota
+/// matches the files. A chunk or write error fails the download: treating it
+/// as EOF would cache a truncated file as valid forever.
+async fn write_chunks(
+    mut response: reqwest::Response,
+    path: &Path,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = fs::File::create(path).await?;
+    let mut written = 0u64;
+    while let Some(chunk) =
+        tokio::time::timeout(std::time::Duration::from_secs(30), response.chunk())
+            .await
+            .map_err(|_| "http cache chunk timed out")?
+            .map_err(|e| format!("http cache chunk failed: {e}"))?
+    {
+        file.write_all(&chunk).await?;
+        written += chunk.len() as u64;
+    }
+    file.flush().await?;
+    Ok(written)
+}
+
+/// Content-addressed file name for a URL. Shared by both caches so a cover and
+/// a track for the same URL can't end up in differently named files.
+fn hash_url(url: &str) -> String {
+    let mut s = FixedState::with_seed(0).build_hasher();
+    s.write(url.as_bytes());
+    format!("{:x}", s.finish())
+}
+
 pub struct ActiveDownloads {
     pub map: SyncMutex<HashMap<String, broadcast::Sender<Result<PathBuf, String>>>>,
 }
@@ -22,6 +79,17 @@ fn get_active_downloads() -> &'static ActiveDownloads {
     ACTIVE_DOWNLOADS.get_or_init(|| ActiveDownloads {
         map: SyncMutex::new(HashMap::new()),
     })
+}
+
+/// Removes the in-flight entry when dropped. Without it, cancelling the
+/// downloader's future (task abort) left its sender in the static map and
+/// every later `get_file` for that URL waited on a channel nobody would use.
+struct DownloadGuard(String);
+
+impl Drop for DownloadGuard {
+    fn drop(&mut self) {
+        get_active_downloads().map.lock().remove(&self.0);
+    }
 }
 
 pub struct HttpCache {
@@ -43,12 +111,20 @@ impl HttpCache {
                 .join("http_cache")
         };
 
-        let client = crate::util::tls::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 YandexMusic/5.82.0")
+        let client = match crate::util::tls::builder()
+            .user_agent(USER_AGENT)
             .pool_max_idle_per_host(5)
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        {
+            Ok(client) => client,
+            Err(e) => {
+                // Same reasoning as the stream client: the custom builder
+                // carries the platform verifier, so losing it must be logged.
+                tracing::error!(error = %e, "http_cache_client_build_failed_using_default");
+                reqwest::Client::new()
+            }
+        };
 
         Self {
             cache_dir,
@@ -59,12 +135,6 @@ impl HttpCache {
 
     pub fn get_cache_dir(&self) -> &Path {
         &self.cache_dir
-    }
-
-    fn hash_url(&self, url: &str) -> String {
-        let mut s = FixedState::with_seed(0).build_hasher();
-        s.write(url.as_bytes());
-        format!("{:x}", s.finish())
     }
 
     pub async fn get_file(
@@ -78,9 +148,9 @@ impl HttpCache {
                 db.get_cache_metadata(url).await.ok().flatten()
             };
 
-            if let Some((path, _, is_expired)) = path_opt {
-                let path = PathBuf::from(&path);
-                if path.exists() && !is_expired {
+            if let Some(entry) = path_opt {
+                let path = PathBuf::from(&entry.path);
+                if path.exists() && !entry.expired {
                     return Ok(path);
                 }
                 // Expired or missing file — will re-download below
@@ -101,22 +171,21 @@ impl HttpCache {
         };
 
         if let Some(tx) = tx {
-            // We are the downloader. Guard the map entry so a cancelled
-            // download never leaves a dead channel behind.
-            let url_key = url.to_string();
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                self.perform_download(url),
-            )
-            .await
-            .map_err(|_| {
-                Box::<dyn std::error::Error + Send + Sync>::from("http cache download timed out")
-            })
-            .and_then(|r| r);
+            // We are the downloader. The guard removes the map entry on every
+            // exit path, including cancellation of this future.
+            let guard = DownloadGuard(url.to_string());
+            let result = tokio::time::timeout(DOWNLOAD_TIMEOUT, self.perform_download(url))
+                .await
+                .map_err(|_| {
+                    Box::<dyn std::error::Error + Send + Sync>::from(
+                        "http cache download timed out",
+                    )
+                })
+                .and_then(|r| r);
 
             // Remove before send: a waiter subscribing between send and remove
             // would wait on an already-fired broadcast channel forever.
-            get_active_downloads().map.lock().remove(&url_key);
+            drop(guard);
 
             // Broadcast the result to all waiters
             let broadcast_result = result
@@ -128,11 +197,7 @@ impl HttpCache {
 
             result
         } else {
-            // Wait for existing download
-            match rx.recv().await? {
-                Ok(path) => Ok(path),
-                Err(e) => Err(e.into()),
-            }
+            await_download(&mut rx).await
         }
     }
 
@@ -140,7 +205,7 @@ impl HttpCache {
         &self,
         url: &str,
     ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-        let filename = self.hash_url(url);
+        let filename = hash_url(url);
 
         let path_only = url.split('?').next().unwrap_or(url);
         let last_segment = path_only.rsplit('/').next().unwrap_or("");
@@ -151,6 +216,9 @@ impl HttpCache {
         };
 
         let file_path = self.cache_dir.join(format!("{}.{}", filename, extension));
+        let part_path = self
+            .cache_dir
+            .join(format!("{}.{}.part", filename, extension));
 
         fs::create_dir_all(&self.cache_dir).await?;
 
@@ -172,33 +240,16 @@ impl HttpCache {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let mut size = response.content_length().unwrap_or(0);
-
-        // Stream the response to file to avoid loading everything into RAM.
-        // A chunk error must fail the download: treating it as EOF would cache
-        // a truncated file as valid forever.
-        let mut file = fs::File::create(&file_path).await?;
-        let mut response = response;
-        while let Some(chunk) = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            response.chunk(),
-        )
-        .await
-        .map_err(|_| {
-            Box::<dyn std::error::Error + Send + Sync>::from("http cache chunk timed out")
-        })?
-        .map_err(|e| {
-            Box::<dyn std::error::Error + Send + Sync>::from(format!("http cache chunk failed: {e}"))
-        })? {
-            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
-        }
-        tokio::io::AsyncWriteExt::flush(&mut file).await?;
-
-        if size == 0
-            && let Ok(metadata) = fs::metadata(&file_path).await
-        {
-            size = metadata.len();
-        }
+        // Write to `.part`, then rename: a cancelled or failed download must
+        // never be left behind as a complete-looking cache entry.
+        let size = match write_chunks(response, &part_path).await {
+            Ok(written) => written,
+            Err(e) => {
+                let _ = fs::remove_file(&part_path).await;
+                return Err(e);
+            }
+        };
+        fs::rename(&part_path, &file_path).await?;
 
         // Update DB
         {
@@ -298,16 +349,10 @@ impl TrackCache {
         &self.cache_dir
     }
 
-    fn hash_url(&self, url: &str) -> String {
-        let mut s = FixedState::with_seed(0).build_hasher();
-        s.write(url.as_bytes());
-        format!("{:x}", s.finish())
-    }
-
     pub async fn save_cover(&self, url: &str, source_path: &Path) -> Result<(), std::io::Error> {
         let covers_dir = self.cache_dir.join("covers");
         fs::create_dir_all(&covers_dir).await?;
-        let filename = self.hash_url(url);
+        let filename = hash_url(url);
         let dest_path = covers_dir.join(format!("{}.jpg", filename));
         if !dest_path.exists() {
             fs::copy(source_path, dest_path).await?;
@@ -317,7 +362,7 @@ impl TrackCache {
 
     pub async fn get_cover(&self, url: &str) -> Option<PathBuf> {
         let covers_dir = self.cache_dir.join("covers");
-        let filename = self.hash_url(url);
+        let filename = hash_url(url);
         let dest_path = covers_dir.join(format!("{}.jpg", filename));
         if dest_path.exists() {
             Some(dest_path)
@@ -326,9 +371,9 @@ impl TrackCache {
         }
     }
 
-    pub async fn get_track_file(&self, track_id: &str) -> Option<(PathBuf, String)> {
+    pub fn get_track_file(&self, track_id: &str) -> Option<(PathBuf, String)> {
         // Try to find the file with any supported extension.
-        // Skips stale `.part` files and empty/corrupt downloads.
+        // Skips empty/corrupt downloads, matching `get_all_track_ids`.
         for (ext, codec) in SUPPORTED_TRACK_EXTS {
             let path = self.cache_dir.join(format!("{}.{}", track_id, ext));
             if path.exists()
@@ -353,13 +398,24 @@ impl TrackCache {
 
         if let Ok(mut entries) = fs::read_dir(&self.cache_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Ok(metadata) = entry.metadata().await
-                    && metadata.is_file()
-                {
-                    let path = entry.path();
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        ids.push(stem.to_string());
-                    }
+                let Ok(metadata) = entry.metadata().await else {
+                    continue;
+                };
+                if !metadata.is_file() || metadata.len() == 0 {
+                    continue;
+                }
+                let path = entry.path();
+                // Only real downloads count. `123.flac.part` (extension
+                // "part") and the legacy `.aac` files are not playable, and
+                // listing them showed phantom entries in the downloads view.
+                let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                    continue;
+                };
+                if !SUPPORTED_TRACK_EXTS.iter().any(|(known, _)| *known == ext) {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    ids.push(stem.to_string());
                 }
             }
         }

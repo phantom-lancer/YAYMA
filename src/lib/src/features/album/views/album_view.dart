@@ -167,6 +167,7 @@ class _AlbumViewState extends State<AlbumView> {
         return CommonAsyncView<AlbumDetailsDto?>(
           state: visibleSignal(context, _albumAsync),
           isEmpty: (album) => album == null,
+          onRetry: requestGlobalRefresh,
           empty: const Center(child: Text('Альбом не найден')),
           builder: (context, album) {
             final albumData = album!;
@@ -233,11 +234,11 @@ class _AlbumViewState extends State<AlbumView> {
                   IconButton(
                     onPressed: () =>
                         unawaited(_toggleAlbumLike(albumData, isLiked)),
-                    tooltip: isLiked ? 'В любимых' : 'В любимые',
                     icon: Icon(
                       isLiked
                           ? Icons.favorite_rounded
                           : Icons.favorite_border_rounded,
+                      semanticLabel: isLiked ? 'В любимых' : 'В любимые',
                     ),
                     style: IconButton.styleFrom(
                       minimumSize: const Size(64, 56),
@@ -253,8 +254,10 @@ class _AlbumViewState extends State<AlbumView> {
                   ),
                   IconButton(
                     onPressed: () => unawaited(_copyAlbumLink(albumData)),
-                    tooltip: 'Ссылка',
-                    icon: const Icon(Icons.link_rounded),
+                    icon: const Icon(
+                      Icons.link_rounded,
+                      semanticLabel: 'Ссылка',
+                    ),
                     style: IconButton.styleFrom(
                       minimumSize: const Size(64, 56),
                       iconSize: 26,

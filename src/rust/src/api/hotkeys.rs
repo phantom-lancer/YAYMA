@@ -49,7 +49,10 @@ pub async fn set_hotkeys_enabled(ctx: &AppContext, enabled: bool) -> HotkeySetti
 /// (unknown action, unmappable key, combo already taken) are reported as a
 /// structured result instead of an error, so the UI can show a precise
 /// message without string matching.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one argument per binding field keeps the FFI signature flat"
+)]
 pub async fn set_hotkey_binding(
     ctx: &AppContext,
     action: String,
@@ -74,7 +77,11 @@ pub async fn set_hotkey_binding(
 
     let mut settings = hotkeys::settings_snapshot();
     if let Some(conflict) = settings.bindings.iter().find(|b| {
-        b.action != action && b.key == key && b.ctrl == ctrl && b.alt == alt && b.shift == shift
+        b.action != action
+            && b.key == key
+            && b.ctrl == ctrl
+            && b.alt == alt
+            && b.shift == shift
             && b.meta == meta
     }) {
         return reject(Some(conflict.action.clone()), false);

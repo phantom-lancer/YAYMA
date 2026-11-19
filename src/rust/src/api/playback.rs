@@ -1,14 +1,24 @@
-use crate::api::models::SimpleTrackDto;
 pub use crate::api::models::{PlaybackState, RepeatModeDto};
+use crate::api::models::{QueueNeighborhoodDto, SimpleTrackDto};
 use crate::app::AppContext;
 use crate::audio::commands::AudioMessage;
+use crate::audio::queue::preview_neighbor;
 
-pub(crate) fn get_playback_state_internal<S: std::hash::BuildHasher>(
+pub(crate) fn get_playback_state_internal(
+    signals: &crate::audio::signals::AudioSignals,
+    liked: &crate::audio::liked::LikedCache,
+) -> PlaybackState {
+    let (liked_ids, disliked_ids) = liked.sets();
+    build_playback_state(signals, liked_ids, disliked_ids)
+}
+
+/// Assembles the bridge payload from borrowed sets so callers with a
+/// `LikedCache` do not have to clone the whole collection per event.
+fn build_playback_state<S: std::hash::BuildHasher>(
     signals: &crate::audio::signals::AudioSignals,
     liked_ids: &std::collections::HashSet<String, S>,
     disliked_ids: &std::collections::HashSet<String, S>,
 ) -> PlaybackState {
-    let current_track = signals.current_track.get();
     PlaybackState {
         is_playing: signals.is_playing.get(),
         is_buffering: signals.is_buffering.get(),
@@ -22,10 +32,14 @@ pub(crate) fn get_playback_state_internal<S: std::hash::BuildHasher>(
         is_shuffled: signals.is_shuffled.get(),
         queue_count: signals.queue_length.get() as u32,
         queue_index: signals.queue_index.get() as u32,
+        queue_revision: signals.queue_revision.get(),
         current_wave_seeds: signals.current_wave_seeds.get(),
         codec: signals.codec.get(),
-        current_track: current_track
-            .map(|t| SimpleTrackDto::from_yandex(&t, liked_ids, disliked_ids)),
+        playback_context: signals.playback_context.get(),
+        current_track: signals.current_track.with(|t| {
+            t.as_ref()
+                .map(|t| SimpleTrackDto::from_yandex(t, liked_ids, disliked_ids))
+        }),
     }
 }
 
@@ -34,7 +48,7 @@ pub fn get_playback_state(
     liked_ids: &std::collections::HashSet<String>,
     disliked_ids: &std::collections::HashSet<String>,
 ) -> PlaybackState {
-    get_playback_state_internal(signals, liked_ids, disliked_ids)
+    build_playback_state(signals, liked_ids, disliked_ids)
 }
 
 pub async fn toggle_play_pause(ctx: &AppContext) {
@@ -66,12 +80,14 @@ pub async fn play_previous_track(ctx: &AppContext) {
 }
 
 pub async fn seek(ctx: &AppContext, position_ms: u32) {
+    let track_id = ctx.audio.signals.current_track_id.get();
     let _ = ctx
         .audio
         .tx
-        .send(AudioMessage::Seek(std::time::Duration::from_millis(
-            position_ms as u64,
-        )))
+        .send(AudioMessage::Seek(
+            std::time::Duration::from_millis(position_ms as u64),
+            track_id,
+        ))
         .await;
 }
 
@@ -92,6 +108,76 @@ pub async fn set_transient_volume_gain(ctx: &AppContext, gain: u8) {
         .tx
         .send(AudioMessage::SetTransientVolumeGain(gain.min(100)))
         .await;
+}
+
+/// Inserts the track right after the current one ("play next").
+/// No-ops when the track cannot be fetched.
+pub async fn queue_add_next(ctx: &AppContext, track_id: String) {
+    if let Ok(tracks) = ctx.core.api.fetch_tracks(vec![track_id]).await
+        && let Some(track) = tracks.into_iter().next()
+    {
+        let _ = ctx.audio.tx.send(AudioMessage::PlayTrackNext(track)).await;
+    }
+}
+
+/// Appends the track to the end of the queue ("add to queue").
+/// In a wave context the insertion lands right after the visible window,
+/// ahead of the rotor tail. No-ops when the track cannot be fetched.
+pub async fn queue_add_last(ctx: &AppContext, track_id: String) {
+    if let Ok(tracks) = ctx.core.api.fetch_tracks(vec![track_id]).await
+        && let Some(track) = tracks.into_iter().next()
+    {
+        let _ = ctx.audio.tx.send(AudioMessage::QueueTrack(track)).await;
+    }
+}
+
+/// Removes the queue entry at `index`. Out-of-range indices are ignored.
+pub async fn queue_remove_at(ctx: &AppContext, index: u32) {
+    let _ = ctx
+        .audio
+        .tx
+        .send(AudioMessage::RemoveFromQueue(index as usize))
+        .await;
+}
+
+/// Empties the queue without stopping the current playback.
+pub async fn queue_clear(ctx: &AppContext) {
+    let _ = ctx.audio.tx.send(AudioMessage::ClearQueue).await;
+}
+
+/// Moves the queue entry at `from` to `to`, keeping the current track
+/// playing when it is the one being moved.
+pub async fn queue_reorder(ctx: &AppContext, from: u32, to: u32) {
+    let _ = ctx
+        .audio
+        .tx
+        .send(AudioMessage::ReorderQueue(from as usize, to as usize))
+        .await;
+}
+
+/// Jumps to the queue entry at `index` and starts playing it, without
+/// resetting the playback context.
+pub async fn queue_jump_to(ctx: &AppContext, index: u32) {
+    let _ = ctx
+        .audio
+        .tx
+        .send(AudioMessage::PlayQueueIndex(index as usize))
+        .await;
+}
+
+/// Sets the repeat mode directly (none / all / single) and persists it.
+pub async fn set_repeat_mode(ctx: &AppContext, mode: RepeatModeDto) {
+    let mode = match mode {
+        RepeatModeDto::None => crate::audio::enums::RepeatMode::None,
+        RepeatModeDto::All => crate::audio::enums::RepeatMode::All,
+        RepeatModeDto::Single => crate::audio::enums::RepeatMode::Single,
+    };
+    let _ = ctx.audio.tx.send(AudioMessage::SetRepeatMode(mode)).await;
+}
+
+/// Enables or disables shuffle and persists the choice.
+pub async fn set_shuffle(ctx: &AppContext, enabled: bool) {
+    let _ = ctx.audio.tx.send(AudioMessage::SetShuffle(enabled)).await;
 }
 
 pub async fn toggle_shuffle(ctx: &AppContext) {
@@ -115,13 +201,70 @@ pub async fn get_queue(ctx: &AppContext) -> Vec<SimpleTrackDto> {
     })
 }
 
-pub async fn get_history(ctx: &AppContext) -> Vec<SimpleTrackDto> {
+/// Returns up to `len` queue entries starting at the absolute position
+/// `offset`, so large queues do not have to be copied whole. Out-of-range
+/// parts are silently clamped.
+pub async fn queue_window(ctx: &AppContext, offset: u32, len: u32) -> Vec<SimpleTrackDto> {
     let (liked_ids, disliked_ids) = ctx.audio.state.read().await.liked.snapshot();
-    ctx.audio.signals.history.with(|h| {
-        h.iter()
+    ctx.audio.signals.queue.with(|q| {
+        let start = (offset as usize).min(q.len());
+        q.iter()
+            .skip(start)
+            .take(len as usize)
             .map(|t| SimpleTrackDto::from_yandex(t, &liked_ids, &disliked_ids))
             .collect()
     })
+}
+
+/// Preview of the queue neighbourhood for the cover hints: the tracks around
+/// the playhead plus the previous/next tracks resolved with the same repeat
+/// policy as real playback, so the hints cannot drift from the queue.
+/// Nothing advances.
+pub async fn queue_neighborhood(ctx: &AppContext) -> QueueNeighborhoodDto {
+    let signals = &ctx.audio.signals;
+    let count = signals.queue_length.get();
+    let index = signals.queue_index.get();
+    let (liked_ids, disliked_ids) = ctx.audio.state.read().await.liked.snapshot();
+
+    signals.queue.with(|q| {
+        let tracks = if count == 0 {
+            Vec::new()
+        } else {
+            let base = index.saturating_sub(1);
+            q.iter()
+                .skip(base)
+                .take(3)
+                .map(|t| SimpleTrackDto::from_yandex(t, &liked_ids, &disliked_ids))
+                .collect()
+        };
+        let neighbor = |forward| {
+            preview_neighbor(count, index, signals.repeat_mode.get(), forward)
+                .and_then(|i| q.get(i))
+                .map(|t| SimpleTrackDto::from_yandex(t, &liked_ids, &disliked_ids))
+        };
+        QueueNeighborhoodDto {
+            tracks,
+            previous: neighbor(false),
+            next: neighbor(true),
+        }
+    })
+}
+
+/// A page of the server-side history shown on the "История" tab. The endpoint
+/// returns its whole window at once, so paging happens on our side: the view
+/// asks for 50 at a time while scrolling.
+pub async fn get_history(ctx: &AppContext, offset: usize, limit: usize) -> Vec<SimpleTrackDto> {
+    let (liked_ids, disliked_ids) = ctx.audio.state.read().await.liked.snapshot();
+    match ctx.core.api.fetch_music_history(offset, limit).await {
+        Ok(tracks) => tracks
+            .into_iter()
+            .map(|t| SimpleTrackDto::from_yandex_owned(t, &liked_ids, &disliked_ids))
+            .collect(),
+        Err(e) => {
+            tracing::error!(error = ?e, "fetch_history_failed");
+            Vec::new()
+        }
+    }
 }
 
 pub async fn play_track(ctx: &AppContext, track_id: String) {
@@ -213,10 +356,11 @@ fn wave_seed_category(seed: &str) -> &str {
 /// - otherwise drop the default seed plus every seed of the same category,
 ///   then add `seed`;
 /// - if nothing is left, fall back to the default seed.
+///
 /// Afterwards a wave is (re)started with the resulting seeds.
 pub async fn toggle_wave_station(ctx: &AppContext, seed: String) {
     let mut seeds = ctx.audio.signals.current_wave_seeds.get();
-    if seeds.iter().any(|s| *s == seed) {
+    if seeds.contains(&seed) {
         seeds.retain(|s| *s != seed);
     } else {
         let prefix = format!("{}:", wave_seed_category(&seed));

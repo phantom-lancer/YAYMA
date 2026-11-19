@@ -1,3 +1,8 @@
+//! TTML (BetterLyrics / Apple-style) lyrics parser with word-level timing.
+//!
+//! Ported to Rust from vivi-music's `TTMLParser.kt` (vivimusic Project
+//! (C) 2026, GPL-3.0), modified 2026.
+
 use crate::lyrics::{ParsedLine, ParsedWord};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -26,7 +31,7 @@ struct PFrame {
 
 fn get_attr(e: &BytesStart, name: &str) -> Option<String> {
     for attr in e.attributes().flatten() {
-        let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+        let key = attr.key.as_ref();
         if key == name || key.ends_with(&format!(":{name}")) {
             return attr
                 .normalized_value(XmlVersion::Implicit1_0)
@@ -38,7 +43,7 @@ fn get_attr(e: &BytesStart, name: &str) -> Option<String> {
 }
 
 fn local_name(e: &BytesStart) -> String {
-    String::from_utf8_lossy(e.name().local_name().as_ref()).to_lowercase()
+    e.name().local_name().as_ref().to_lowercase()
 }
 
 fn parse_time(time_str: &str) -> f64 {
@@ -204,7 +209,7 @@ pub fn parse_ttml(ttml: &str) -> Vec<ParsedLine> {
                 just_closed_span = false;
             }
             Ok(Event::Text(t)) => {
-                let text = t.decode().unwrap_or_default().to_string();
+                let text = t.into_inner();
                 if let Some(frame) = span_stack.last_mut() {
                     frame.text.push_str(&text);
                 } else if just_closed_span && text.chars().any(|c| c.is_whitespace()) {
@@ -222,7 +227,7 @@ pub fn parse_ttml(ttml: &str) -> Vec<ParsedLine> {
                 }
             }
             Ok(Event::End(e)) => {
-                let name = String::from_utf8_lossy(e.name().local_name().as_ref()).to_lowercase();
+                let name = e.name().local_name().as_ref().to_lowercase();
                 if name == "span" {
                     if let Some(frame) = span_stack.pop() {
                         close_span(frame, &mut span_stack, &mut p_frame);

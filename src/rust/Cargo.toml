@@ -2,6 +2,7 @@
 name = "yayma"
 edition = "2024"
 version = "0.1.0"
+license = "GPL-3.0-or-later"
 
 [lib]
 name = "yayma"
@@ -9,11 +10,9 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 
-mimalloc = { version = "0.1.52" }
-
 # Core 
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs"] }
-reqwest = { version = "0.13.4", default-features = false, features = [
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs"] }
+reqwest = { version = "0.13.5", default-features = false, features = [
   "rustls",
   "brotli",
   "json",
@@ -24,13 +23,17 @@ reqwest = { version = "0.13.4", default-features = false, features = [
 
 # Audio
 symphonia = { version = "0.5.5", default-features = false}
-rodio = { version = "0.22.2", default-features = false, features = [
+# `symphonia-wav` exists only so the seek tests can build a WAV fixture in
+# memory; the app never streams WAV (SUPPORTED_TRACK_EXTS has no entry).
+rodio = { version = "0.23.0", default-features = false, features = [
   "playback",
   "symphonia-flac",
   "symphonia-aac",
   "symphonia-mp3",
   "symphonia-isomp4",
   "symphonia-simd",
+  "symphonia-wav",
+  "symphonia-pcm",
   "tracing",
   "crossbeam-channel",
 ] }
@@ -46,29 +49,29 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 directories = "6.0.0"
 
 # Utilities
-flume = "0.12.0"
-rand = "0.10.2"
-crossbeam-channel = "0.5.16"
-thiserror = "2.0.20"
+flume = { version = "0.12.0", default-features = false, features = ["async"] }
+fastrand = "2.5.0"
+crossbeam-channel = "0.5.17"
+thiserror = "2.0.21"
 futures = "0.3.34"
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 
 im = "15.1.0"
-arc-swap = "1.9.2"
-rusqlite = { version = "0.40", features = ["bundled"] }
+arc-swap = "1.9.5"
+rusqlite = { version = "0.43.0", default-features = false, features = ["bundled"] }
 
 
-parking_lot = "0.12.5"
+parking_lot = "0.13"
 foldhash = "0.2.0"
 urlencoding = "2.1.3"
 lofty = "0.25.1"
 bytes = "1.12.1"
 regex = "1.13.1"
-quick-xml = "0.41.0"
+quick-xml = "0.42.0"
 [target.'cfg(not(target_os = "android"))'.dependencies]
 discord-rich-presence = "1.1.0"
 wayclip-global-hotkey = "0.7"
-souvlaki = { git = "https://github.com/Sinono3/souvlaki", rev = "93ff3d1" }
+souvlaki = "0.9.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62.2", features = [
@@ -85,14 +88,36 @@ windows = { version = "0.62.2", features = [
     "Win32_Media_Audio",
 ] }
 
+# Same alsa crate cpal already links on Linux; referenced directly to probe
+# what ALSA 'default' actually resolves to (see audio::util).
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.11"
+# Compile cpal's native PulseAudio host into the same cpal rodio already
+# uses (cargo features are additive across the graph): default_host() then
+# connects to the session sound server (PipeWire through pipewire-pulse, or
+# PulseAudio) over its socket instead of opening ALSA 'default', which on
+# systems without the server bridge resolves to raw hardware and grabs the
+# card exclusively, freezing the desktop's audio. Pure-Rust protocol client,
+# no C dependencies; a session without the socket stays on the ALSA host.
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
+
 [target.'cfg(target_os = "android")'.dependencies]
-rustls-platform-verifier = { version = "0.7.0", features = ["jni"] }
+rustls-platform-verifier = { version = "0.7.1", features = ["jni"] }
 jni = "0.22"
 ndk-context = "0.1.1"
-mimalloc = { version = "0.1.52", features = ["local_dynamic_tls"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+[lints.clippy]
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "warn"
+allow_attributes_without_reason = "warn"
+redundant_clone = "warn"
+dbg_macro = "warn"
+todo = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
 
 [profile.release]
 opt-level = 3

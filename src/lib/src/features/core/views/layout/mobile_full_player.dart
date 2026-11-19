@@ -6,23 +6,26 @@ import 'dart:ui' as ui;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/physics.dart';
 import 'package:flutter/scheduler.dart';
-import 'package:m3e_core/m3e_core.dart';
+import 'package:flutter/services.dart' show PredictiveBackEvent;
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
 import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
+
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
 import 'package:yayma/src/features/core/views/layout/mobile_cover_swipe.dart';
 import 'package:yayma/src/features/core/views/layout/mobile_plate.dart';
 import 'package:yayma/src/features/core/views/layout/player_lyrics.dart';
 import 'package:yayma/src/features/core/views/widgets/app_cover.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
+import 'package:yayma/src/features/core/views/widgets/morphing_play_button.dart';
 import 'package:yayma/src/features/core/views/widgets/rust_cached_image.dart';
 import 'package:yayma/src/features/core/views/widgets/track_context_actions.dart';
 import 'package:yayma/src/features/core/views/widgets/track_elements.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/features/playback/views/sleep_timer_sheet.dart';
+import 'package:yayma/src/features/playback/views/queue_panel.dart';
 import 'package:yayma/src/features/playback/views/wave_view.dart';
 import 'package:yayma/src/rust/api/models.dart';
 
@@ -133,7 +136,7 @@ class MobileFullPlayer extends StatefulWidget {
 }
 
 class _MobileFullPlayerState extends State<MobileFullPlayer>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   late final AnimationController _controller;
   late final AnimationController _coverSwipe;
 
@@ -174,6 +177,7 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _controller = AnimationController(vsync: this);
     _controller.addListener(_syncProgress);
     _lyricsFade = AnimationController(
@@ -196,7 +200,7 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
       animation: _coverSwipe,
       initialTrack: initialState?.currentTrack,
       initialIndex: initialState?.queueIndex,
-      queue: () => queueTracksSignal().value ?? const [],
+      queue: () => queueTracksSignal.value,
       travel: () => _swipeTravel(context),
       canAnimate: () => !_closing && _controller.value >= 0.95,
       isMounted: () => mounted,
@@ -238,6 +242,7 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     mobileFullPlayerOpenSignal.value = false;
     mobileFullPlayerProgress.value = 0;
     widget.controller?._detach(this);
@@ -346,6 +351,42 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
   void _onVerticalDragStart(DragStartDetails details) {
     if (_closing) return;
     _controller.stop();
+  }
+
+  // Android predictive back. The player is an overlay, not a route, so while
+  // it is the topmost surface it drives its own collapse with the finger:
+  // progress 0 (gesture started) maps to fully open, progress 1 to collapsed.
+  // The plain back button stays on the PopScope path below, so it keeps the
+  // spring close instead of jumping straight to the mini player.
+  @override
+  bool handleStartBackGesture(PredictiveBackEvent backEvent) {
+    // Routes above (a sheet or a pushed page) own the gesture, and a player
+    // that is already closing settles on its own.
+    if (backEvent.isButtonEvent || !mounted || _closing) {
+      return false;
+    }
+    if (Navigator.of(context).canPop()) {
+      return false;
+    }
+    return true;
+  }
+
+  @override
+  void handleUpdateBackGestureProgress(PredictiveBackEvent backEvent) {
+    if (!mounted || _closing) return;
+    _applyDragProgress(1 - backEvent.progress);
+  }
+
+  @override
+  void handleCommitBackGesture() {
+    if (!mounted || _closing) return;
+    _settleFromDrag(expand: false);
+  }
+
+  @override
+  void handleCancelBackGesture() {
+    if (!mounted || _closing) return;
+    _settleFromDrag(expand: true);
   }
 
   void _onVerticalDragUpdate(DragUpdateDetails details) {
@@ -542,7 +583,6 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
     final panelBackgroundAlpha = panelOpacity * (isAppleGlass ? 0.54 : 1.0);
 
     final miniAlpha = surface.alpha;
-    final miniBlur = surface.blur;
     final miniColor = surface.color;
     final miniContentOpacity =
         1 - const Interval(0.16, 0.4, curve: Curves.easeOut).transform(panelT);
@@ -566,18 +606,11 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
                   Positioned.fill(
                     child: Opacity(
                       opacity: 1 - panelOpacity,
-                      child: BackdropFilter(
-                        enabled: blurEffectsEnabledSignal.value && miniBlur > 0,
-                        filter: ui.ImageFilter.blur(
-                          sigmaX: miniBlur,
-                          sigmaY: miniBlur,
-                        ),
-                        child: DecoratedBox(
-                          decoration: BoxDecoration(
-                            color: miniColor.withValues(alpha: miniAlpha),
-                            borderRadius: BorderRadius.circular(panelRadius),
-                            border: Border.all(color: surface.borderColor),
-                          ),
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: miniColor.withValues(alpha: miniAlpha),
+                          borderRadius: BorderRadius.circular(panelRadius),
+                          border: Border.all(color: surface.borderColor),
                         ),
                       ),
                     ),
@@ -665,7 +698,6 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
                       panelRect,
                       openCoverRect,
                       coverRadius,
-                      panelT,
                       metrics.coverRect.width,
                       dx:
                           _coverSwipe.value +
@@ -690,7 +722,6 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
                     panelRect,
                     coverRect,
                     coverRadius,
-                    panelT,
                     metrics.coverRect.width,
                     dx: _coverSwipe.value,
                     coverUrl: _swipe.holdUrl,
@@ -742,7 +773,6 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
     Rect panelRect,
     Rect coverRect,
     double radius,
-    double progress,
     double side, {
     double dx = 0,
     String? coverUrl,
@@ -751,74 +781,60 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
     double scale = 1,
     bool interactive = true,
   }) {
-    // The shadow is the most expensive thing to paint here, and it only
-    // changes when the panel animates or the artwork loads: keep it in its
-    // own layer instead of re-blurring it per frame.
+    // Its own layer keeps the artwork off the panel's per-frame repaint path.
     final Widget artwork = RepaintBoundary(
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(radius),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.35 * progress),
-              blurRadius: 12 + 24 * progress,
-              offset: Offset(0, 8 * progress),
-            ),
-          ],
-        ),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(radius),
-          child: SignalBuilder(
-            builder: (context) {
-              final rawUrl = coverUrl ?? trackMetadataSignal().coverUrl;
-              final dpr = MediaQuery.devicePixelRatioOf(context);
-              final targetPx = (side * dpr).round().clamp(0, 800);
-              final lowResUrl = rawUrl == null
-                  ? null
-                  : resolveCoverUrl(rawUrl, (48 * dpr).round());
-              final highResUrl = rawUrl == null
-                  ? null
-                  : resolveCoverUrl(rawUrl, targetPx);
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(radius),
+        child: SignalBuilder(
+          builder: (context) {
+            final rawUrl = coverUrl ?? trackMetadataSignal().coverUrl;
+            final dpr = MediaQuery.devicePixelRatioOf(context);
+            final targetPx = (side * dpr).round().clamp(0, 800);
+            final lowResUrl = rawUrl == null
+                ? null
+                : resolveCoverUrl(rawUrl, (48 * dpr).round());
+            final highResUrl = rawUrl == null
+                ? null
+                : resolveCoverUrl(rawUrl, targetPx);
 
-              final placeholder = lowResUrl == null
-                  ? CoverPlaceholder(size: side, icon: Icons.music_note)
-                  : RustCachedImage(
-                      imageUrl: lowResUrl,
-                      width: side,
-                      height: side,
-                      cacheWidth: (48 * dpr).round(),
-                      cacheHeight: (48 * dpr).round(),
-                    );
+            final placeholder = lowResUrl == null
+                ? CoverPlaceholder(size: side, icon: Icons.music_note)
+                : RustCachedImage(
+                    imageUrl: lowResUrl,
+                    width: side,
+                    height: side,
+                    cacheWidth: (48 * dpr).round(),
+                    cacheHeight: (48 * dpr).round(),
+                  );
 
-              return GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                // Follow the finger from where it went down: with the default
-                // the cover only starts moving after the drag is accepted,
-                // which reads as lag on the first few pixels.
-                dragStartBehavior: DragStartBehavior.down,
-                onTap: onTap,
-                onHorizontalDragStart: _onCoverDragStart,
-                onHorizontalDragUpdate: _onCoverDragUpdate,
-                onHorizontalDragEnd: _onCoverDragEnd,
-                onHorizontalDragCancel: _onCoverDragCancel,
-                child: FittedBox(
-                  fit: BoxFit.fill,
-                  child: SizedBox.square(
-                    dimension: side,
-                    child: RustCachedImage(
-                      imageUrl: highResUrl,
-                      width: side,
-                      height: side,
-                      cacheWidth: targetPx,
-                      cacheHeight: targetPx,
-                      placeholder: placeholder,
-                      errorWidget: placeholder,
-                    ),
+            return GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              // Follow the finger from where it went down: with the default
+              // the cover only starts moving after the drag is accepted,
+              // which reads as lag on the first few pixels.
+              dragStartBehavior: DragStartBehavior.down,
+              onTap: onTap,
+              onHorizontalDragStart: _onCoverDragStart,
+              onHorizontalDragUpdate: _onCoverDragUpdate,
+              onHorizontalDragEnd: _onCoverDragEnd,
+              onHorizontalDragCancel: _onCoverDragCancel,
+              child: FittedBox(
+                fit: BoxFit.fill,
+                child: SizedBox.square(
+                  dimension: side,
+                  child: RustCachedImage(
+                    imageUrl: highResUrl,
+                    width: side,
+                    height: side,
+                    cacheWidth: targetPx,
+                    cacheHeight: targetPx,
+                    placeholder: placeholder,
+                    errorWidget: placeholder,
                   ),
                 ),
-              );
-            },
-          ),
+              ),
+            );
+          },
         ),
       ),
     );
@@ -826,8 +842,7 @@ class _MobileFullPlayerState extends State<MobileFullPlayer>
     return Positioned(
       // Only the resting layout here: the swipe / slide offset goes through
       // the transform below, so moving the carousel is compositing only.
-      // A changing Positioned rect would relayout the cover and invalidate
-      // its cached raster (the large blurred shadow) on every frame.
+      // A changing Positioned rect would relayout the cover on every frame.
       left: coverRect.left - panelRect.left,
       top: coverRect.top - panelRect.top,
       width: coverRect.width,
@@ -887,10 +902,13 @@ class _FullPlayerMetrics {
     final controlsHeight = compact ? 76.0 : 88.0;
     final actionsHeight = compact ? 52.0 : 58.0;
     final bottomGap = compact ? 4.0 : 8.0;
-    final horizontalPadding = size.width < 420 ? 20.0 : 28.0;
-    final sectionWidth = math.min<double>(
-      size.width - horizontalPadding * 2,
-      520,
+    final minPadding = size.width < 420 ? 20.0 : 28.0;
+    final sectionWidth = math.min<double>(size.width - minPadding * 2, 520);
+    // On wide windows (tablets, landscape) the phone-wide column is centred
+    // instead of hugging the left edge while the header above it is centred.
+    final horizontalPadding = math.max<double>(
+      minPadding,
+      (size.width - sectionWidth) / 2,
     );
     final safeHeight = math.max<double>(
       0,
@@ -919,14 +937,12 @@ class _FullPlayerMetrics {
     // cover; the height that is left over goes between the title and the
     // progress bar, so the controls stay anchored to the bottom.
     final coverTop = padding.top + headerHeight + coverTopGap;
+    // The cover is centred in the section: it is height-limited on wide
+    // windows and would otherwise hang on the left of a centred column.
+    final coverLeft = horizontalPadding + (sectionWidth - coverSide) / 2;
 
     return _FullPlayerMetrics(
-      coverRect: Rect.fromLTWH(
-        horizontalPadding,
-        coverTop,
-        coverSide,
-        coverSide,
-      ),
+      coverRect: Rect.fromLTWH(coverLeft, coverTop, coverSide, coverSide),
       coverSpace: coverSide + coverGap + coverTopGap,
       headerHeight: headerHeight,
       infoHeight: infoHeight,
@@ -1261,11 +1277,11 @@ class _FullPlayerHeader extends StatelessWidget {
         children: [
           IconButton(
             onPressed: onClose,
-            tooltip: 'Свернуть',
             icon: Icon(
               Icons.keyboard_arrow_down_rounded,
               size: 28,
               color: onSurfaceVariant,
+              semanticLabel: 'Свернуть',
             ),
           ),
           Expanded(
@@ -1287,11 +1303,11 @@ class _FullPlayerHeader extends StatelessWidget {
                 width: 48,
                 child: IconButton(
                   onPressed: hasTrack ? onToggleLyrics : null,
-                  tooltip: 'Текст песни',
                   icon: Icon(
                     Icons.lyrics_rounded,
                     size: 24,
                     color: lyrics ? accent : onSurfaceVariant,
+                    semanticLabel: 'Текст песни',
                   ),
                   padding: EdgeInsets.zero,
                   visualDensity: VisualDensity.compact,
@@ -1322,8 +1338,8 @@ class _FullPlayerWaveButton extends StatelessWidget {
             color: isWaveActive
                 ? accent
                 : Theme.of(context).colorScheme.onSurfaceVariant,
+            semanticLabel: 'Настройки волны',
           ),
-          tooltip: 'Настройки волны',
           onPressed: () => unawaited(showWaveSettingsSheet(context)),
         );
       },
@@ -1419,7 +1435,10 @@ class _FullPlayerTrackInfo extends StatelessWidget {
                         coverUrl: meta.coverUrl,
                       ).showSheet(context),
                     ),
-                    icon: const Icon(Icons.more_vert_rounded),
+                    icon: const Icon(
+                      Icons.more_vert_rounded,
+                      semanticLabel: 'Действия',
+                    ),
                     iconSize: 22,
                     color: cs.onSurfaceVariant,
                     padding: EdgeInsets.zero,
@@ -1428,7 +1447,6 @@ class _FullPlayerTrackInfo extends StatelessWidget {
                       minWidth: 36,
                       minHeight: 36,
                     ),
-                    tooltip: 'Действия',
                   ),
               ],
             ),
@@ -1642,36 +1660,12 @@ class _FullPlayerControls extends StatelessWidget {
               icon: Icon(Icons.skip_previous_rounded, color: onSurface),
               onPressed: PlaybackController.prev,
             ),
-            IconButton(
-              iconSize: 76,
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 76, minHeight: 76),
-              icon: showBuffering
-                  ? M3ECircularWavyProgressIndicator(
-                      strokeWidth: 3,
-                      color: accent,
-                    )
-                  : AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 250),
-                      switchInCurve: Curves.easeOutBack,
-                      switchOutCurve: Curves.easeIn,
-                      transitionBuilder: (child, animation) {
-                        return FadeTransition(
-                          opacity: animation,
-                          child: ScaleTransition(
-                            scale: animation,
-                            child: child,
-                          ),
-                        );
-                      },
-                      child: Icon(
-                        isPlaying
-                            ? Icons.pause_circle_filled_rounded
-                            : Icons.play_circle_filled_rounded,
-                        key: ValueKey<bool>(isPlaying),
-                        color: onSurface,
-                      ),
-                    ),
+            MorphingPlayPauseButton(
+              isPlaying: isPlaying,
+              isBuffering: showBuffering,
+              size: 76,
+              iconSize: 42,
+              color: accent,
               onPressed: PlaybackController.togglePlay,
             ),
             IconButton(
@@ -1715,6 +1709,8 @@ class _FullPlayerActions extends StatelessWidget {
         final isShuffled = isShuffledSignal();
         final repeatMode = repeatModeSignal();
         final onSurfaceVariant = Theme.of(context).colorScheme.onSurfaceVariant;
+        // The rotor session owns the wave queue: shuffle/repeat are disabled.
+        final isWaveActive = isWaveActiveSignal();
 
         var repeatIcon = Icons.repeat_rounded;
         if (repeatMode == RepeatModeDto.single) {
@@ -1728,20 +1724,31 @@ class _FullPlayerActions extends StatelessWidget {
               iconSize: 24,
               icon: Icon(
                 Icons.shuffle_rounded,
-                color: isShuffled ? accent : onSurfaceVariant,
+                color: isWaveActive
+                    ? onSurfaceVariant.withValues(alpha: 0.38)
+                    : isShuffled
+                    ? accent
+                    : onSurfaceVariant,
               ),
-              onPressed: PlaybackController.toggleShuffle,
+              onPressed: isWaveActive ? null : PlaybackController.toggleShuffle,
             ),
             _FullPlayerWaveButton(accent: accent),
             IconButton(
               iconSize: 24,
+              icon: Icon(Icons.queue_music_rounded, color: onSurfaceVariant),
+              onPressed: () => unawaited(showQueuePanel(context)),
+            ),
+            IconButton(
+              iconSize: 24,
               icon: Icon(
                 repeatIcon,
-                color: repeatMode != RepeatModeDto.none
+                color: isWaveActive
+                    ? onSurfaceVariant.withValues(alpha: 0.38)
+                    : repeatMode != RepeatModeDto.none
                     ? accent
                     : onSurfaceVariant,
               ),
-              onPressed: PlaybackController.toggleRepeat,
+              onPressed: isWaveActive ? null : PlaybackController.toggleRepeat,
             ),
           ],
         );

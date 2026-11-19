@@ -21,11 +21,13 @@ use crate::audio::fetcher::{
     FetchState, WAVE_VISIBLE_TRACKS, WaveExtensionHandles, WaveTrackEvent, WaveTrackOutcome,
     is_usable_wave_session,
 };
-use crate::audio::history::HistoryState;
 use crate::audio::prefetcher::UrlPrefetcher;
 use crate::audio::shuffle::ShuffleState;
 
 const URL_PREFETCH_WINDOW: usize = 5;
+/// Unplayed rotor-generated tracks expire 30 minutes after they were fetched
+/// (desktop beforeInject calibration), so stale recommendations never pile up.
+const WAVE_TRACK_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 // Keep a reasonably sized playback window ahead of the current item.  The
 // fetcher loads 50 tracks at a time, so starting a request with ten items left
 // gives the request enough time to complete without making initial playlist
@@ -62,24 +64,14 @@ mod wave_feedback {
 /// methods below; only branch conditions and window math live here so
 /// they are testable without signals/streaming state.
 mod fetch_policy {
-    use super::HistoryState;
     use super::Track;
     use super::Vector;
     use super::WAVE_VISIBLE_TRACKS;
     use super::WaveTrackEvent;
-    use super::as_wave_seed;
 
-    pub(super) const MAX_HISTORY_SEEDS: usize = 20;
-
-    pub(super) fn history_seeds(history: &HistoryState) -> Vec<String> {
-        let len = history.entries.len();
-        history
-            .entries
-            .iter()
-            .skip(len.saturating_sub(MAX_HISTORY_SEEDS))
-            .map(as_wave_seed)
-            .collect()
-    }
+    /// The rotor `queue` dedup parameter carries up to the last 100 played
+    /// vibe tracks ("trackId:albumId"), matching the desktop client.
+    pub(super) const MAX_HISTORY_SEEDS: usize = 100;
 
     pub(super) fn playlist_needs_topup(
         is_wave: bool,
@@ -151,6 +143,36 @@ pub enum PlaybackContext {
     Standalone,
 }
 
+impl PlaybackContext {
+    /// Bridge-facing projection of the active context; `title` is only set
+    /// when the context carried one at load time.
+    pub fn to_dto(&self) -> crate::api::models::PlaybackContextDto {
+        let (kind, id, title) = match self {
+            PlaybackContext::Playlist(p) => {
+                ("playlist", Some(p.kind.to_string()), Some(p.title.clone()))
+            }
+            PlaybackContext::Artist(a) => ("artist", a.id.clone(), a.name.clone()),
+            PlaybackContext::Album(a) => ("album", a.id.map(|i| i.to_string()), a.title.clone()),
+            PlaybackContext::Track(t) => ("track", Some(t.id.clone()), t.title.clone()),
+            PlaybackContext::Wave(s) => (
+                "wave",
+                Some(
+                    s.radio_session_id
+                        .clone()
+                        .unwrap_or_else(|| s.batch_id.clone()),
+                ),
+                None,
+            ),
+            PlaybackContext::Standalone => ("standalone", None, None),
+        };
+        crate::api::models::PlaybackContextDto {
+            kind: kind.to_string(),
+            id,
+            title,
+        }
+    }
+}
+
 struct PlaybackPolicy;
 
 impl PlaybackPolicy {
@@ -178,6 +200,30 @@ impl PlaybackPolicy {
     }
 }
 
+/// UI-only preview of the queue neighbour under the same policy as real
+/// playback, so the next/previous cover hints cannot drift from the queue.
+/// `forward` selects next (repeat-single replays the current track); previews
+/// never move the playhead.
+pub(crate) fn preview_neighbor(
+    queue_len: usize,
+    current: usize,
+    repeat: RepeatMode,
+    forward: bool,
+) -> Option<usize> {
+    if queue_len == 0 {
+        return None;
+    }
+    if forward {
+        if repeat == RepeatMode::Single {
+            return Some(current);
+        }
+        PlaybackPolicy::try_advance(current, queue_len)
+            .or_else(|| PlaybackPolicy::repeat_wrap_index(repeat, queue_len))
+    } else {
+        PlaybackPolicy::prev_index(current, queue_len, repeat)
+    }
+}
+
 #[derive(Clone)]
 struct QueueSignals {
     inner: AudioSignals,
@@ -185,7 +231,7 @@ struct QueueSignals {
 
 impl QueueSignals {
     fn new(inner: AudioSignals) -> Self {
-        inner.set_queue(Vector::new(), Vector::new(), 0);
+        inner.set_queue(Vector::new(), 0);
         inner.set_repeat_mode(RepeatMode::None);
         inner.set_shuffled(false);
         Self { inner }
@@ -213,24 +259,33 @@ impl QueueSignals {
         self.inner.queue_length.set(len);
     }
 
-    fn set_history(&self, history: Vector<Track>) {
-        self.inner.history.set(history);
-    }
-
     fn set_index(&self, index: usize) {
         self.inner.queue_index.set(index);
     }
 
     fn set_repeat_mode(&self, mode: RepeatMode) {
-        self.inner.repeat_mode.set(mode);
+        self.inner.set_repeat_mode(mode);
     }
 
     fn set_shuffled(&self, shuffled: bool) {
-        self.inner.is_shuffled.set(shuffled);
+        self.inner.set_shuffled(shuffled);
     }
 
     fn set_wave_seeds(&self, seeds: Vec<String>) {
-        self.inner.current_wave_seeds.set(seeds);
+        self.inner.set_wave_seeds(seeds);
+    }
+
+    fn set_playback_context(&self, context: &PlaybackContext) {
+        self.inner.playback_context.set(Some(context.to_dto()));
+    }
+
+    /// Bumps the queue revision and wakes the bridge worker so queue edits
+    /// reach the UI even when length and index are unchanged.
+    fn bump_revision(&self) {
+        self.inner
+            .queue_revision
+            .update(|revision| *revision = revision.wrapping_add(1));
+        self.inner.changed.send_replace(());
     }
 
     fn wave_seeds(&self) -> Vec<String> {
@@ -243,6 +298,10 @@ impl QueueSignals {
 
     fn raw_queue_length_handle(&self) -> Signal<usize> {
         self.inner.queue_length.clone()
+    }
+
+    fn raw_queue_revision_handle(&self) -> Signal<u32> {
+        self.inner.queue_revision.clone()
     }
 }
 
@@ -258,17 +317,21 @@ pub struct QueueManager {
 
     shuffle: ShuffleState,
 
-    history: HistoryState,
-
     fetch: FetchState,
 
     wave_buffer: VecDeque<Track>,
+    /// Fetch timestamp per rotor-generated track id, for the 30-minute TTL.
+    wave_fetch_times: foldhash::HashMap<String, std::time::Instant>,
     wave_feedbacks: Vec<WaveTrackEvent>,
     wave_feedback_sent: bool,
     track_progress: Arc<TrackProgress>,
     /// Bumped on every load()/clear() to invalidate stale background tasks
     /// (wave_by_seed session creation).
     generation: Arc<std::sync::atomic::AtomicU64>,
+    /// One-shot: the playing row was removed and its successor slid into
+    /// the cursor slot; the next advance must stay on the cursor instead
+    /// of current+1, which would silently skip the successor.
+    advance_in_place: bool,
 }
 
 impl QueueManager {
@@ -279,7 +342,7 @@ impl QueueManager {
         signals: AudioSignals,
         track_progress: Arc<TrackProgress>,
     ) -> Self {
-        let url_prefetcher = UrlPrefetcher::new(api.clone(), url_cache.clone());
+        let url_prefetcher = UrlPrefetcher::new(api.clone(), url_cache);
 
         Self {
             api,
@@ -288,18 +351,28 @@ impl QueueManager {
             signals: QueueSignals::new(signals),
             playback_context: Arc::new(Mutex::new(PlaybackContext::Standalone)),
             shuffle: ShuffleState::inactive(),
-            history: HistoryState::empty(),
             fetch: FetchState::new(),
             wave_buffer: VecDeque::new(),
+            wave_fetch_times: foldhash::HashMap::default(),
             wave_feedbacks: Vec::new(),
             wave_feedback_sent: false,
             track_progress,
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            advance_in_place: false,
         }
     }
 
-    pub fn wave_context(&self) -> Option<Session> {
-        self.fetch.wave_session_clone()
+    /// Runs `f` with the stored wave session under the lock. Callers that only
+    /// read a field must not clone it: it carries a whole page of tracks.
+    pub fn with_wave_session<R>(&self, f: impl FnOnce(&Session) -> R) -> Option<R> {
+        self.fetch.with_wave_session(f)
+    }
+
+    /// Runs `f` with the active context under the lock. Callers that only read
+    /// a field must not clone the context: a playlist/album carries its whole
+    /// track list.
+    pub fn with_playback_context<R>(&self, f: impl FnOnce(&PlaybackContext) -> R) -> R {
+        f(&self.playback_context.lock())
     }
 
     pub fn in_wave(&self) -> bool {
@@ -321,14 +394,25 @@ impl QueueManager {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        *self.playback_context.lock() = context;
+        // Shuffle is a player-level setting (desktop parity): it survives a
+        // context switch and is re-applied to the freshly loaded queue below.
+        // The wave queue is owned by the rotor session, so it never starts
+        // shuffled.
+        let keep_shuffled =
+            self.signals.is_shuffled() && !matches!(context, PlaybackContext::Wave(_));
+        {
+            // Moved, not cloned: the DTO below is all the bridge needs from it.
+            let mut guard = self.playback_context.lock();
+            *guard = context;
+            self.signals.set_playback_context(&guard);
+        }
         self.shuffle.reset();
-        self.history.reset();
+        self.advance_in_place = false;
         self.wave_buffer.clear();
+        self.wave_fetch_times.clear();
         self.wave_feedbacks.clear();
         self.wave_feedback_sent = false;
-        self.signals.set_history(Vector::new());
-        self.signals.set_shuffled(false);
+        self.signals.set_shuffled(keep_shuffled);
 
         if start_index >= tracks.len() {
             start_index = 0;
@@ -356,8 +440,13 @@ impl QueueManager {
                         return None;
                     }
 
-                    self.signals.set_queue(tracks);
-                    self.signals.set_index(start_index);
+                    Self::install_loaded_queue(
+                        &self.signals,
+                        &mut self.shuffle,
+                        tracks,
+                        start_index,
+                        keep_shuffled,
+                    );
                     None
                 }
 
@@ -365,8 +454,13 @@ impl QueueManager {
                 | PlaybackContext::Album(_)
                 | PlaybackContext::Standalone => {
                     self.signals.set_wave_seeds(Vec::new());
-                    self.signals.set_queue(tracks);
-                    self.signals.set_index(start_index);
+                    Self::install_loaded_queue(
+                        &self.signals,
+                        &mut self.shuffle,
+                        tracks,
+                        start_index,
+                        keep_shuffled,
+                    );
                     None
                 }
 
@@ -376,8 +470,15 @@ impl QueueManager {
                         tracks.iter().take(visible_count).cloned().collect();
                     let hidden: Vec<Track> = tracks.into_iter().skip(visible_count).collect();
 
+                    // Stamped directly (the context guard is held here).
+                    let now = std::time::Instant::now();
+                    for t in visible.iter().chain(hidden.iter()) {
+                        self.wave_fetch_times.insert(t.id.clone(), now);
+                    }
+
                     self.signals.set_queue(visible);
-                    self.signals.set_index(start_index.min(visible_count.saturating_sub(1).max(0)));
+                    self.signals
+                        .set_index(start_index.min(visible_count.saturating_sub(1)));
                     for t in hidden {
                         self.wave_buffer.push_back(t);
                     }
@@ -391,6 +492,9 @@ impl QueueManager {
                         seed_track.id,
                         seed_track.title.as_deref().unwrap_or("Unknown")
                     )]);
+                    // A seed context transitions straight into rotor-owned
+                    // territory, where shuffle does not apply.
+                    self.signals.set_shuffled(false);
                     let mut initial_queue = Vector::new();
                     initial_queue.push_back((**seed_track).clone());
                     self.signals.set_queue(initial_queue);
@@ -411,11 +515,34 @@ impl QueueManager {
 
         let start = self.signals.index();
         let track = self.signals.queue().get(start).cloned();
-        if let Some(t) = &track {
-            self.commit_track_to_history(t.clone());
+        if track.is_some() {
             self.update_prefetch_interest();
         }
         track
+    }
+
+    /// Installs a freshly loaded queue; when shuffle survived the context
+    /// switch, the new queue is rolled with its start track anchored first
+    /// (the same semantics as enabling shuffle mid-playback). Takes the two
+    /// fields it needs directly: callers run while the playback-context lock
+    /// guard is held, so a `&mut self` method would conflict with it.
+    fn install_loaded_queue(
+        signals: &QueueSignals,
+        shuffle: &mut ShuffleState,
+        tracks: Vector<Track>,
+        start_index: usize,
+        shuffled: bool,
+    ) {
+        if shuffled {
+            let (queue, index) = shuffle.enable(tracks, start_index);
+            signals.set_queue(queue);
+            signals.set_index(index);
+            signals.set_shuffled(true);
+        } else {
+            signals.set_queue(tracks);
+            signals.set_index(start_index);
+            signals.set_shuffled(false);
+        }
     }
 
     fn wave_by_seed(&self, seed_track: &Track) {
@@ -427,9 +554,11 @@ impl QueueManager {
         let handles = WaveExtensionHandles {
             queue: self.signals.raw_queue_handle(),
             queue_length: self.signals.raw_queue_length_handle(),
+            queue_revision: self.signals.raw_queue_revision_handle(),
             wave_session: self.fetch.wave_session_arc(),
             wave_batch_ids: self.fetch.wave_batch_ids_arc(),
             playback_context: self.playback_context.clone(),
+            playback_context_dto: self.signals.inner.playback_context.clone(),
             generation,
             generation_ref,
         };
@@ -454,6 +583,28 @@ impl QueueManager {
         self.next_track(false).await
     }
 
+    /// The track the gapless preheat should park: the queue successor of the
+    /// current track under the active repeat policy. Purely observational —
+    /// nothing advances. `RepeatMode::Single` returns the current track so
+    /// the parked preheat slot replays it instantly at the boundary.
+    pub fn peek_gapless_next(&self) -> Option<Track> {
+        let queue = self.signals.queue();
+        if queue.is_empty() {
+            return None;
+        }
+        let repeat = self.signals.repeat_mode();
+        if repeat == RepeatMode::Single {
+            return queue.get(self.signals.index()).cloned();
+        }
+        let next = self.signals.index() + 1;
+        if next < queue.len() {
+            queue.get(next).cloned()
+        } else {
+            PlaybackPolicy::repeat_wrap_index(repeat, queue.len())
+                .and_then(|wrapped| queue.get(wrapped).cloned())
+        }
+    }
+
     /// Next track for a user-initiated skip: advances past the current
     /// track even when `RepeatMode::Single` is active.
     pub async fn skip_track(&mut self) -> Option<Track> {
@@ -465,15 +616,14 @@ impl QueueManager {
             return None;
         }
 
-        if self.in_wave()
-            && self
-                .fetch_wave_session_clone()
-                .is_some_and(|s| s.terminated)
-        {
+        if self.in_wave() && self.fetch.wave_session_terminated() {
             self.recreate_wave_session().await;
         }
 
         if !user_skip && self.signals.repeat_mode() == RepeatMode::Single {
+            // The cursor row starts replaying now: a pending remove-debt
+            // (advance_in_place) is paid.
+            self.advance_in_place = false;
             return self.signals.queue().get(self.signals.index()).cloned();
         }
 
@@ -511,11 +661,19 @@ impl QueueManager {
             self.signals.queue().len(),
             self.signals.repeat_mode(),
         )?;
+        // The previous row starts playing: a pending remove-debt is moot.
+        self.advance_in_place = false;
         self.advance_to(prev)
     }
 
     async fn try_advance_or_fetch(&mut self, current: usize) -> Option<Track> {
         let queue_len = self.signals.queue().len();
+        // One-shot from remove_track: the successor slid into the cursor
+        // slot when the playing row was deleted, so the first advance stays
+        // put once instead of skipping it with current+1.
+        if std::mem::take(&mut self.advance_in_place) && current < queue_len {
+            return self.advance_to(current);
+        }
         if let Some(next) = PlaybackPolicy::try_advance(current, queue_len) {
             return self.advance_to(next);
         }
@@ -533,7 +691,8 @@ impl QueueManager {
             if let Some(session) = session {
                 // Page response: keep the created session stable, only
                 // remember which batch delivered these tracks.
-                self.fetch.remember_wave_batch(&session.batch_id, &new_tracks);
+                self.fetch
+                    .remember_wave_batch(&session.batch_id, &new_tracks);
             }
             if !new_tracks.is_empty() {
                 self.wave_append(new_tracks);
@@ -547,24 +706,21 @@ impl QueueManager {
     }
 
     pub async fn skip_wave_track(&mut self) -> Option<Track> {
-        if self.in_wave()
-            && self
-                .fetch_wave_session_clone()
-                .is_some_and(|s| s.terminated)
-        {
+        if self.in_wave() && self.fetch.wave_session_terminated() {
             self.recreate_wave_session().await;
         }
-        if self.in_wave() && !self.wave_feedback_sent {
-            if let Some(track) = self.signals.queue().get(self.signals.index()).cloned() {
-                self.wave_feedbacks.push(wave_feedback::build_event(
-                    &track,
-                    WaveTrackOutcome::Skipped,
-                    self.fetch.wave_batch_for(&track.id),
-                    self.track_progress.current_position(),
-                    None,
-                ));
-                self.wave_feedback_sent = true;
-            }
+        if self.in_wave()
+            && !self.wave_feedback_sent
+            && let Some(track) = self.signals.queue().get(self.signals.index()).cloned()
+        {
+            self.wave_feedbacks.push(wave_feedback::build_event(
+                &track,
+                WaveTrackOutcome::Skipped,
+                self.fetch.wave_batch_for(&track.id),
+                self.track_progress.current_position(),
+                None,
+            ));
+            self.wave_feedback_sent = true;
         }
 
         let current = self.signals.index();
@@ -617,9 +773,9 @@ impl QueueManager {
         self.signals.set_index(index);
         self.wave_feedback_sent = false;
         let track = self.signals.queue().get(index).cloned()?;
-        self.commit_track_to_history(track.clone());
 
         if self.in_wave() {
+            self.prune_expired_wave_tracks();
             self.refill_wave_window(true);
         }
 
@@ -640,27 +796,42 @@ impl QueueManager {
         Some(track)
     }
 
-    pub fn queue_track(&mut self, track: Track) {
+    /// Shared tail of the queue-insert operations.
+    fn insert_into_queue(&mut self, track: Track, insert_at: usize) {
         let mut queue = self.signals.queue();
-        let current_index = self.signals.index();
-
-        let insert_at = if queue.is_empty() {
-            0
-        } else {
-            current_index + 1
-        };
-
         if insert_at <= queue.len() {
-            queue.insert(insert_at, track);
+            queue.insert(insert_at, track.clone());
             self.signals.set_queue(queue);
-            self.shuffle.record_inserted(insert_at);
+            self.shuffle.record_inserted(track, insert_at);
         }
+        self.signals.bump_revision();
         self.refill_wave_window(true);
         self.update_prefetch_interest();
     }
 
+    /// "Add to queue": appends at the end. In a wave context the rotor tail
+    /// lives in the buffer, so the track pins right after the visible window
+    /// (current + WAVE_VISIBLE_TRACKS) instead of the absolute end.
+    pub fn queue_track(&mut self, track: Track) {
+        let queue = self.signals.queue();
+        let insert_at = if queue.is_empty() {
+            0
+        } else if self.in_wave() {
+            (self.signals.index() + 1 + WAVE_VISIBLE_TRACKS).min(queue.len())
+        } else {
+            queue.len()
+        };
+        self.insert_into_queue(track, insert_at);
+    }
+
+    /// "Play next": inserts right after the current track, in wave contexts too.
     pub fn play_next(&mut self, track: Track) {
-        self.queue_track(track);
+        let insert_at = if self.signals.queue().is_empty() {
+            0
+        } else {
+            self.signals.index() + 1
+        };
+        self.insert_into_queue(track, insert_at);
     }
 
     pub fn remove_track(&mut self, index: usize) {
@@ -681,10 +852,77 @@ impl QueueManager {
                 self.signals.set_index(0);
             } else if current_index >= len {
                 self.signals.set_index(len - 1);
+            } else {
+                // The successor slid into the cursor slot while the removed
+                // track keeps playing; the next advance must not skip it.
+                self.advance_in_place = true;
             }
         }
+        self.signals.bump_revision();
         self.refill_wave_window(true);
         self.update_prefetch_interest();
+    }
+
+    /// Moves the entry at `from` to `to` in the active (visible) order. Under
+    /// shuffle the user's arrangement sticks: the original-queue mapping is
+    /// reordered alongside. The cursor follows so the currently playing track
+    /// keeps playing seamlessly when it is the one being moved.
+    pub fn reorder(&mut self, from: usize, to: usize) {
+        let mut queue = self.signals.queue();
+        if from == to || from >= queue.len() || to >= queue.len() {
+            return;
+        }
+        let current_index = self.signals.index();
+        let current_id = queue.get(current_index).map(|t| t.id.clone());
+
+        let track = queue.remove(from);
+        queue.insert(to, track);
+
+        let new_index = if from == current_index {
+            to
+        } else if from < current_index && to >= current_index {
+            current_index - 1
+        } else if from > current_index && to <= current_index {
+            current_index + 1
+        } else {
+            current_index
+        };
+
+        self.signals.set_queue(queue);
+        self.shuffle.record_reorder(from, to);
+        self.signals.set_index(new_index);
+
+        // The playing track must not change identity across a reorder.
+        debug_assert_eq!(
+            self.signals.queue().get(new_index).map(|t| t.id.clone()),
+            current_id
+        );
+
+        self.signals.bump_revision();
+        self.refill_wave_window(true);
+        self.update_prefetch_interest();
+    }
+
+    /// Jumps to the queue entry at `index` and returns it for playback. Under
+    /// shuffle the order is re-rolled anchored on the target track (the
+    /// desktop behaviour: the target becomes the first upcoming track).
+    pub fn jump_to(&mut self, index: usize) -> Option<Track> {
+        let queue_len = self.signals.queue().len();
+        if queue_len == 0 {
+            return None;
+        }
+        let index = index.min(queue_len - 1);
+        // The jumped-to row starts playing: a pending remove-debt is moot.
+        self.advance_in_place = false;
+        if self.signals.is_shuffled() {
+            let queue = self.signals.queue();
+            let (shuffled, new_index) = self.shuffle.reroll_anchored(queue, index);
+            self.signals.set_queue(shuffled);
+            self.signals.set_index(new_index);
+            self.advance_to(new_index)
+        } else {
+            self.advance_to(index)
+        }
     }
 
     pub fn clear(&mut self) {
@@ -694,24 +932,22 @@ impl QueueManager {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.signals.set_queue(Vector::new());
         self.signals.set_index(0);
-        self.signals.set_history(Vector::new());
-        self.signals.set_repeat_mode(RepeatMode::None);
-        self.signals.set_shuffled(false);
+        // Repeat/shuffle are player-level settings: they survive clearing and
+        // re-apply to whatever plays next (clear() also runs on Stop).
         self.signals.set_wave_seeds(Vec::new());
         self.signals.inner.set_stream_info(None);
 
         self.shuffle.reset();
-        self.history.reset();
+        self.advance_in_place = false;
         self.wave_buffer.clear();
+        self.wave_fetch_times.clear();
         self.wave_feedbacks.clear();
         self.wave_feedback_sent = false;
         *self.playback_context.lock() = PlaybackContext::Standalone;
+        self.signals
+            .set_playback_context(&PlaybackContext::Standalone);
 
         self.update_prefetch_interest();
-    }
-
-    fn fetch_wave_session_clone(&self) -> Option<Session> {
-        self.fetch.wave_session_clone()
     }
 
     fn trigger_fetch(&mut self) {
@@ -726,15 +962,18 @@ impl QueueManager {
             return;
         }
 
-        if let Some(session) = self.fetch_wave_session_clone() {
-            if session.terminated {
+        if let Some((terminated, usable)) = self
+            .fetch
+            .with_wave_session(|s| (s.terminated, is_usable_wave_session(s)))
+        {
+            if terminated {
                 // Dead session: paging/feedback on it is rejected by the
                 // server. Recreate happens in the async next/skip paths
                 // (sync context can't await create_session); don't spam
                 // doomed page requests or lose feedbacks here.
                 return;
             }
-            if !is_usable_wave_session(&session) {
+            if !usable {
                 // No radio_session_id (and preservation had nothing to keep):
                 // trigger_wave_batch would just drop our finish/skip events
                 // with MissingWaveSession, so don't take them.
@@ -769,8 +1008,7 @@ impl QueueManager {
         let clean: Vec<String> = seeds.iter().map(|s| clean_wave_seed(s)).collect();
         match self.api.create_session(clean).await {
             Ok(session) => {
-                let tracks: Vec<Track> =
-                    session.sequence.iter().map(|s| s.track.clone()).collect();
+                let tracks: Vec<Track> = session.sequence.iter().map(|s| s.track.clone()).collect();
                 if tracks.is_empty() {
                     error!("wave_session_recreate_empty");
                     return;
@@ -784,11 +1022,19 @@ impl QueueManager {
     }
 
     /// `queue` for the next `/tracks` page mirrors the original client: the
-    /// played history (oldest → newest, capped) — NOT the upcoming queue or
+    /// played tracks (oldest → newest, capped) — NOT the upcoming queue or
     /// the prefetch buffer. Sending future tracks as `queue` confuses the
     /// recommender and contributes to wave resets.
     fn build_wave_history_seeds(&self) -> Vec<String> {
-        fetch_policy::history_seeds(&self.history)
+        let queue = self.signals.queue();
+        let played = self.signals.index() + 1;
+        let start = played.saturating_sub(fetch_policy::MAX_HISTORY_SEEDS);
+        queue
+            .iter()
+            .take(played)
+            .skip(start)
+            .map(as_wave_seed)
+            .collect()
     }
 
     /// Prepend failed page feedbacks so they are retried with the next page.
@@ -798,10 +1044,8 @@ impl QueueManager {
         if failed.is_empty() {
             return;
         }
-        self.wave_feedbacks = fetch_policy::merge_failed_feedbacks(
-            std::mem::take(&mut self.wave_feedbacks),
-            failed,
-        );
+        self.wave_feedbacks =
+            fetch_policy::merge_failed_feedbacks(std::mem::take(&mut self.wave_feedbacks), failed);
     }
 
     /// Per-track `batchId` for immediate (`/feedback`) wave feedbacks.
@@ -864,7 +1108,69 @@ impl QueueManager {
         }
     }
 
+    /// Stamps rotor-delivered tracks with their fetch time for the TTL prune.
+    fn record_wave_fetch<'a, I: IntoIterator<Item = &'a Track>>(&mut self, tracks: I) {
+        if !self.in_wave() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        for t in tracks {
+            self.wave_fetch_times.insert(t.id.clone(), now);
+        }
+    }
+
+    /// Queue navigation housekeeping: unplayed rotor tracks older than
+    /// `WAVE_TRACK_TTL` leave the visible tail and the buffer. Played tracks
+    /// (the prefix up to the current one) and the current track are never
+    /// dropped.
+    fn prune_expired_wave_tracks(&mut self) {
+        if !self.in_wave() || self.wave_fetch_times.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let current_index = self.signals.index();
+        let mut queue = self.signals.queue();
+        let played: std::collections::HashSet<&str> = queue
+            .iter()
+            .take(current_index + 1)
+            .map(|t| t.id.as_str())
+            .collect();
+        let current_id = queue.get(current_index).map(|t| t.id.clone());
+        let expired_ids: std::collections::HashSet<String> = self
+            .wave_fetch_times
+            .iter()
+            .filter(|(id, ts)| {
+                now.duration_since(**ts) > WAVE_TRACK_TTL
+                    && !played.contains(id.as_str())
+                    && current_id.as_deref() != Some(id.as_str())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if expired_ids.is_empty() {
+            return;
+        }
+
+        let mut removed = false;
+        for i in (current_index + 1..queue.len()).rev() {
+            if expired_ids.contains(&queue[i].id) {
+                queue.remove(i);
+                self.shuffle.record_removed(i);
+                removed = true;
+            }
+        }
+        if removed {
+            self.signals.set_queue(queue);
+            self.signals.bump_revision();
+        }
+        let buffer_len = self.wave_buffer.len();
+        self.wave_buffer.retain(|t| !expired_ids.contains(&t.id));
+        if removed || self.wave_buffer.len() != buffer_len {
+            self.update_prefetch_interest();
+        }
+    }
+
     fn wave_append(&mut self, tracks: Vec<Track>) {
+        self.record_wave_fetch(tracks.iter());
         if self.in_wave() {
             let mut known_ids: std::collections::HashSet<String> =
                 self.signals.queue().iter().map(|t| t.id.clone()).collect();
@@ -887,6 +1193,9 @@ impl QueueManager {
                 }
             }
         } else {
+            // Lazy playlist top-up: extend the source order too, so a later
+            // shuffle-disable keeps the loaded tail.
+            self.shuffle.record_appended(&tracks);
             let mut queue = self.signals.queue();
             queue.extend(tracks);
             self.signals.set_queue(queue);
@@ -905,7 +1214,15 @@ impl QueueManager {
         let (current_id, candidate_ids, next_track) =
             fetch_policy::prefetch_window(&queue, current_index, URL_PREFETCH_WINDOW);
 
-        if let Some(next_track) = next_track {
+        // Under repeat-single the gapless preheat replays the current track,
+        // so that is the session to keep prewarmed.
+        let preheat_target = if self.signals.repeat_mode() == RepeatMode::Single {
+            queue.get(current_index).cloned()
+        } else {
+            next_track
+        };
+
+        if let Some(next_track) = preheat_target {
             self.stream_manager.prewarm(next_track);
         }
 
@@ -921,23 +1238,27 @@ impl QueueManager {
         self.url_prefetcher.update(needed, current_id);
     }
 
-    fn commit_track_to_history(&mut self, track: Track) {
-        self.history.push(track);
-        self.signals.set_history(self.history.as_vector());
+    pub fn set_repeat_mode(&mut self, mode: RepeatMode) {
+        self.signals.set_repeat_mode(mode);
     }
 
-    pub fn toggle_repeat_mode(&mut self) {
+    pub fn toggle_repeat_mode(&mut self) -> RepeatMode {
         let new_mode = match self.signals.repeat_mode() {
             RepeatMode::None => RepeatMode::All,
             RepeatMode::All => RepeatMode::Single,
             RepeatMode::Single => RepeatMode::None,
         };
-        self.signals.set_repeat_mode(new_mode);
-        self.signals.inner.changed.send_replace(());
+        self.set_repeat_mode(new_mode);
+        new_mode
     }
 
-    pub fn toggle_shuffle(&mut self) {
-        if self.signals.is_shuffled() {
+    /// Idempotent shuffle switch: enabling re-rolls the order anchored on the
+    /// current track, disabling restores the original order.
+    pub fn set_shuffle(&mut self, enabled: bool) {
+        if self.signals.is_shuffled() == enabled {
+            return;
+        }
+        if !enabled {
             let current_index = self.signals.index();
             if let Some((original_queue, restored_index)) = self.shuffle.disable(current_index) {
                 self.signals.set_queue(original_queue);
@@ -952,8 +1273,14 @@ impl QueueManager {
             self.signals.set_index(new_index);
             self.signals.set_shuffled(true);
         }
-        self.signals.inner.changed.send_replace(());
         self.update_prefetch_interest();
+    }
+
+    /// Returns the resulting shuffle state so the caller can persist it.
+    pub fn toggle_shuffle(&mut self) -> bool {
+        let target = !self.signals.is_shuffled();
+        self.set_shuffle(target);
+        target
     }
 }
 
@@ -1051,6 +1378,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gapless_peek_returns_successor_without_advancing() {
+        let mut q = manager().await;
+        q.load(PlaybackContext::Standalone, standalone(3), 0).await;
+        assert_eq!(q.peek_gapless_next().unwrap().id, "t1");
+        // Pure peek: the queue cursor must not have moved.
+        assert_eq!(q.get_next_track().await.unwrap().id, "t1");
+    }
+
+    #[tokio::test]
+    async fn gapless_peek_under_repeat_single_returns_current() {
+        let mut q = manager().await;
+        q.load(PlaybackContext::Standalone, standalone(3), 1).await;
+        q.toggle_repeat_mode(); // None -> All
+        q.toggle_repeat_mode(); // All -> Single
+        // The preheat slot parks a replay of the current track itself.
+        assert_eq!(q.peek_gapless_next().unwrap().id, "t1");
+        // Pure peek: the queue cursor must not have moved.
+        assert_eq!(q.get_next_track().await.unwrap().id, "t1");
+    }
+
+    #[tokio::test]
+    async fn gapless_peek_wraps_under_repeat_all() {
+        let mut q = manager().await;
+        q.load(PlaybackContext::Standalone, standalone(2), 1).await;
+        q.toggle_repeat_mode(); // None -> All
+        assert_eq!(q.peek_gapless_next().unwrap().id, "t0");
+    }
+
+    #[tokio::test]
+    async fn gapless_peek_at_tail_without_repeat_is_none() {
+        let mut q = manager().await;
+        q.load(PlaybackContext::Standalone, standalone(2), 1).await;
+        assert!(q.peek_gapless_next().is_none());
+    }
+
+    #[tokio::test]
     async fn skip_advances_under_repeat_single() {
         let mut q = manager().await;
         q.load(PlaybackContext::Standalone, standalone(3), 1).await;
@@ -1080,6 +1443,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_current_track_then_natural_advance_plays_successor() {
+        let mut q = manager().await;
+        q.load(PlaybackContext::Standalone, standalone(3), 1).await;
+        q.remove_track(1); // "t1" keeps playing; "t2" slides into slot 1.
+        // The natural end must land on the successor, not skip it (which
+        // would end the queue and auto-start the default wave).
+        let next = q.get_next_track().await.expect("successor plays next");
+        assert_eq!(next.id, "t2");
+    }
+
+    #[tokio::test]
+    async fn disable_shuffle_keeps_edits_made_while_shuffled() {
+        let mut q = manager().await;
+        q.load(PlaybackContext::Standalone, standalone(3), 1).await;
+        q.toggle_shuffle();
+        q.play_next(test_track("next"));
+        // Remove an upcoming row (whatever track holds visible slot 2).
+        let removed_id = q.signals.queue()[2].id.clone();
+        q.remove_track(2);
+        q.toggle_shuffle(); // disable: edits must survive the restore.
+        let ids: Vec<String> = q.signals.queue().iter().map(|t| t.id.clone()).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(!ids.contains(&removed_id));
+        // "next" still plays right after the current track.
+        let i = ids.iter().position(|id| id == "t1").expect("t1 playing");
+        assert_eq!(ids[i + 1], "next");
+        assert_eq!(q.signals.queue()[q.signals.index()].id, "t1");
+    }
+
+    #[tokio::test]
+    async fn reorder_moves_track_and_follows_cursor() {
+        let mut q = manager().await;
+        q.load(PlaybackContext::Standalone, standalone(5), 2).await;
+        // Move "t0" to the end: [t1 t2 t3 t4 t0], cursor stays on t2 (index 1).
+        q.reorder(0, 4);
+        assert_eq!(
+            q.signals
+                .queue()
+                .iter()
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["t1", "t2", "t3", "t4", "t0"]
+        );
+        assert_eq!(q.signals.index(), 1);
+        // Move the playing track itself: identity must follow the cursor.
+        q.reorder(1, 0);
+        assert_eq!(q.signals.index(), 0);
+        assert_eq!(q.signals.queue()[0].id, "t2");
+        // Revision bumped so the UI observes the same-length reorder.
+        assert!(q.signals.inner.queue_revision.get() >= 1);
+    }
+
+    #[tokio::test]
+    async fn reorder_under_shuffle_keeps_mapping_valid() {
+        let mut q = manager().await;
+        q.load(PlaybackContext::Standalone, standalone(5), 0).await;
+        q.toggle_shuffle();
+        assert_eq!(q.signals.index(), 0);
+        let current_before = q.signals.queue()[0].id.clone();
+        let shuffled_before: Vec<String> = q.signals.queue().iter().map(|t| t.id.clone()).collect();
+
+        // Reorder within the shuffled order and move the entry back.
+        q.reorder(1, 3);
+        q.reorder(3, 1);
+        let after_roundtrip: Vec<String> = q.signals.queue().iter().map(|t| t.id.clone()).collect();
+
+        // Undoing the reorder restores the exact shuffled order.
+        assert_eq!(after_roundtrip, shuffled_before);
+        // Current track unchanged and still at index 0.
+        assert_eq!(q.signals.queue()[0].id, current_before);
+        assert_eq!(q.signals.index(), 0);
+
+        // Disable restores the original order and maps the cursor back.
+        q.toggle_shuffle();
+        assert_eq!(
+            q.signals
+                .queue()
+                .iter()
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["t0", "t1", "t2", "t3", "t4"]
+        );
+        assert_eq!(q.signals.queue()[q.signals.index()].id, current_before);
+    }
+
+    #[tokio::test]
+    async fn jump_to_plays_target_and_keeps_queue() {
+        let mut q = manager().await;
+        q.load(PlaybackContext::Standalone, standalone(5), 0).await;
+        let track = q.jump_to(3).expect("jump target");
+        assert_eq!(track.id, "t3");
+        assert_eq!(q.signals.index(), 3);
+        // Out-of-range index clamps to the tail.
+        let tail = q.jump_to(99).expect("clamped jump");
+        assert_eq!(tail.id, "t4");
+    }
+
+    #[tokio::test]
+    async fn jump_to_under_shuffle_anchors_target_first() {
+        let mut q = manager().await;
+        q.load(PlaybackContext::Standalone, standalone(6), 0).await;
+        q.toggle_shuffle();
+        // The target is whatever track the shuffled order holds at index 4.
+        let target = q.signals.queue()[4].id.clone();
+        let track = q.jump_to(4).expect("jump target");
+        assert_eq!(track.id, target);
+        // The target becomes the first upcoming track.
+        assert_eq!(q.signals.index(), 0);
+        assert_eq!(q.signals.queue()[0].id, target);
+        // Same multiset of tracks.
+        let mut ids: Vec<String> = q.signals.queue().iter().map(|t| t.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["t0", "t1", "t2", "t3", "t4", "t5"]);
+    }
+
+    #[tokio::test]
+    async fn load_preserves_shuffle_across_context_switch() {
+        let mut q = manager().await;
+        q.load(PlaybackContext::Standalone, standalone(5), 0).await;
+        q.toggle_shuffle();
+        assert!(q.signals.is_shuffled());
+
+        // A new context keeps the shuffle (persisted flag survives restarts
+        // through load_persisted_settings): the new start track anchors first.
+        q.load(PlaybackContext::Standalone, standalone(4), 2).await;
+        assert!(q.signals.is_shuffled());
+        assert_eq!(q.signals.index(), 0);
+        assert_eq!(q.signals.queue()[0].id, "t2");
+
+        // Disabling restores the fresh queue's own order, cursor on t2.
+        q.toggle_shuffle();
+        assert_eq!(
+            q.signals
+                .queue()
+                .iter()
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["t0", "t1", "t2", "t3"]
+        );
+        assert_eq!(q.signals.queue()[q.signals.index()].id, "t2");
+    }
+
+    #[tokio::test]
+    async fn wave_queue_track_pins_after_visible_window() {
+        let mut q = manager().await;
+        let session: Session = serde_json::from_str(
+            r#"{"batchId":"b","descriptionSeed":null,"pumpkin":false,
+                "radioSessionId":"r","sequence":[],"terminated":false,
+                "wave":null,"unknownSession":null}"#,
+        )
+        .expect("minimal session parses");
+        *q.playback_context.lock() = PlaybackContext::Wave(session);
+        q.signals.set_queue(standalone(4)); // current + 3 visible ahead
+        q.signals.set_index(0);
+        q.wave_buffer = (4..=6).map(|i| test_track(&format!("t{i}"))).collect();
+
+        // "Add to queue" must insert after the visible window (index 4),
+        // not at the absolute end and not next to the current track.
+        q.queue_track(test_track("pinned"));
+        let ids: Vec<String> = q.signals.queue().iter().map(|t| t.id.clone()).collect();
+        assert_eq!(ids, vec!["t0", "t1", "t2", "t3", "pinned"]);
+        // The rotor tail stays in the buffer behind the pinned track.
+        assert_eq!(
+            q.wave_buffer
+                .iter()
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["t4", "t5", "t6"]
+        );
+
+        // "Play next" still inserts at current + 1.
+        q.play_next(test_track("next"));
+        let ids: Vec<String> = q.signals.queue().iter().map(|t| t.id.clone()).collect();
+        assert_eq!(ids, vec!["t0", "next", "t1", "t2", "t3", "pinned"]);
+    }
+
+    #[tokio::test]
+    async fn non_wave_queue_track_appends_at_end() {
+        let mut q = manager().await;
+        q.load(PlaybackContext::Standalone, standalone(3), 0).await;
+        q.queue_track(test_track("last"));
+        let ids: Vec<String> = q.signals.queue().iter().map(|t| t.id.clone()).collect();
+        assert_eq!(ids, vec!["t0", "t1", "t2", "last"]);
+    }
+
+    #[tokio::test]
     async fn clear_empties_queue() {
         let mut q = manager().await;
         q.load(PlaybackContext::Standalone, standalone(3), 0).await;
@@ -1100,25 +1649,36 @@ mod tests {
 
     #[tokio::test]
     async fn wave_history_seeds_are_played_in_order() {
-        let mut q = manager().await;
-        for i in 0..5 {
-            q.history.push(test_track(&format!("t{i}")));
-        }
+        let q = manager().await;
+        q.signals.set_queue(standalone(5));
+        q.signals.set_index(4);
         // Playback order (oldest -> newest), no future/buffered tracks.
         let seeds = q.build_wave_history_seeds();
         assert_eq!(seeds, vec!["t0", "t1", "t2", "t3", "t4"]);
     }
 
     #[tokio::test]
-    async fn wave_history_seeds_cap_at_20_newest() {
-        let mut q = manager().await;
-        for i in 0..25 {
-            q.history.push(test_track(&format!("t{i}")));
-        }
+    async fn wave_history_seeds_cap_at_100_newest() {
+        let q = manager().await;
+        q.signals.set_queue(standalone(105));
+        q.signals.set_index(104);
         let seeds = q.build_wave_history_seeds();
-        assert_eq!(seeds.len(), 20);
+        assert_eq!(seeds.len(), 100);
         assert_eq!(seeds[0], "t5");
-        assert_eq!(seeds[19], "t24");
+        assert_eq!(seeds[99], "t104");
+    }
+
+    #[test]
+    fn wave_seeds_keep_the_parts_the_rotor_needs() {
+        // `track:<id>:<title>` carries a display title that the rotor rejects.
+        assert_eq!(clean_wave_seed("track:123:Some Title"), "track:123");
+        // Everything else is passed as-is, including the playlist seed that
+        // names both the owner and the kind.
+        assert_eq!(
+            clean_wave_seed("playlist:1022032131:42"),
+            "playlist:1022032131:42"
+        );
+        assert_eq!(clean_wave_seed("user:onyourwave"), "user:onyourwave");
     }
 
     #[test]
@@ -1196,5 +1756,42 @@ mod tests {
             q.wave_batch_for_track(&test_track("t1")).as_deref(),
             Some("page-2")
         );
+    }
+
+    #[test]
+    fn preview_neighbor_is_none_for_an_empty_queue() {
+        for repeat in [RepeatMode::None, RepeatMode::All, RepeatMode::Single] {
+            assert_eq!(preview_neighbor(0, 0, repeat, true), None);
+            assert_eq!(preview_neighbor(0, 0, repeat, false), None);
+        }
+    }
+
+    #[test]
+    fn preview_neighbor_forward_matches_the_queue_policy() {
+        // Plain advance stops at the tail unless repeat-all wraps.
+        assert_eq!(preview_neighbor(3, 0, RepeatMode::None, true), Some(1));
+        assert_eq!(preview_neighbor(3, 2, RepeatMode::None, true), None);
+        assert_eq!(preview_neighbor(3, 2, RepeatMode::All, true), Some(0));
+        // Repeat-single replays the current track.
+        assert_eq!(preview_neighbor(3, 1, RepeatMode::Single, true), Some(1));
+    }
+
+    #[test]
+    fn preview_neighbor_backward_matches_the_queue_policy() {
+        assert_eq!(preview_neighbor(3, 2, RepeatMode::None, false), Some(1));
+        assert_eq!(preview_neighbor(3, 0, RepeatMode::None, false), None);
+        assert_eq!(preview_neighbor(3, 0, RepeatMode::All, false), Some(2));
+        // Repeat-single does not wrap backwards.
+        assert_eq!(preview_neighbor(3, 0, RepeatMode::Single, false), None);
+    }
+
+    #[test]
+    fn preview_neighbor_handles_a_single_track_queue() {
+        assert_eq!(preview_neighbor(1, 0, RepeatMode::None, true), None);
+        assert_eq!(preview_neighbor(1, 0, RepeatMode::All, true), Some(0));
+        assert_eq!(preview_neighbor(1, 0, RepeatMode::Single, true), Some(0));
+        assert_eq!(preview_neighbor(1, 0, RepeatMode::None, false), None);
+        assert_eq!(preview_neighbor(1, 0, RepeatMode::All, false), Some(0));
+        assert_eq!(preview_neighbor(1, 0, RepeatMode::Single, false), None);
     }
 }

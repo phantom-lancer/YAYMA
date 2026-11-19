@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/services.dart' show PredictiveBackEvent;
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
@@ -15,6 +16,8 @@ import 'package:yayma/src/features/core/views/layout/background.dart';
 import 'package:yayma/src/features/core/views/layout/mobile_full_player.dart';
 import 'package:yayma/src/features/core/views/layout/navigation_bar.dart';
 import 'package:yayma/src/features/core/views/layout/player_bar.dart';
+import 'package:yayma/src/features/core/views/widgets/responsive.dart';
+import 'package:yayma/src/features/core/views/widgets/tab_slide.dart';
 import 'package:yayma/src/features/core/views/widgets/tab_visibility.dart';
 import 'package:yayma/src/features/home/views/home_view.dart';
 import 'package:yayma/src/features/library/views/library_view.dart';
@@ -32,14 +35,96 @@ class AppLayout extends StatefulWidget {
   State<AppLayout> createState() => _AppLayoutState();
 }
 
-class _AppLayoutState extends State<AppLayout> {
+class _AppLayoutState extends State<AppLayout>
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   final PageStorageBucket _bucket = PageStorageBucket();
+
+  /// Which way the last tab switch went, for [TabSlide]. Read from the same
+  /// build that flips the active root, so the leaving tab gets the same value.
+  AppSection? _lastRoot;
+  int _tabDirection = 1;
+
+  /// Predictive back gesture progress, 0 at rest and 1 when the screen is gone.
+  late final AnimationController _back = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 200),
+  );
+  NavState? _backScreen;
+  NavState? _backUnder;
+  int _backToken = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _back.dispose();
+    super.dispose();
+  }
+
+  @override
+  bool handleStartBackGesture(PredictiveBackEvent backEvent) {
+    // A sheet or pushed page above the app gets the gesture first, and so does
+    // the full player, which drives its own collapse while it is open. Only
+    // the root tab keeps the system back behaviour.
+    // Navigator.of does not subscribe to route changes, unlike ModalRoute.of,
+    // which would rebuild the whole layout on every sheet open and close.
+    if (Navigator.of(context).canPop()) return false;
+    if (!canGoBackSignal.value || mobileFullPlayerOpenSignal.value) {
+      return false;
+    }
+    _backToken++;
+    _backScreen = currentNavStateSignal.value;
+    final stack = navStackSignal.value;
+    _backUnder = stack[stack.length - 2];
+    _back.value = 0;
+    return true;
+  }
+
+  @override
+  void handleUpdateBackGestureProgress(PredictiveBackEvent backEvent) {
+    _back.value = backEvent.progress;
+  }
+
+  @override
+  void handleCommitBackGesture() {
+    final token = _backToken;
+    unawaited(
+      _back.animateTo(1, curve: Curves.easeOut).then((_) {
+        goBack();
+        // Keep the leaving screen shrunk while its own fade-out runs.
+        Future<void>.delayed(const Duration(milliseconds: 500), () {
+          if (!mounted || token != _backToken) return;
+          _backScreen = null;
+          _backUnder = null;
+          _back.value = 0;
+        });
+      }),
+    );
+  }
+
+  @override
+  void handleCancelBackGesture() {
+    _back.animateTo(0, curve: Curves.easeOut);
+  }
 
   @override
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
-        currentRootSignal();
+        final activeRoot = currentRootSignal();
+        if (_lastRoot != activeRoot) {
+          final from = rootSections.indexOf(_lastRoot ?? activeRoot);
+          final to = rootSections.indexOf(activeRoot);
+          if (from >= 0 && to >= 0 && from != to) {
+            _tabDirection = to > from ? 1 : -1;
+          }
+          _lastRoot = activeRoot;
+        }
         final navState = currentNavStateSignal();
         final isHome = navState.section == AppSection.home;
 
@@ -47,10 +132,9 @@ class _AppLayoutState extends State<AppLayout> {
             Platform.isWindows || Platform.isLinux || Platform.isMacOS;
         final isCustomTitlebar = isDesktop && customTitlebarSignal.value;
 
-        final screenWidth = MediaQuery.sizeOf(context).width;
         // Use the touch layout for all Android form factors, including
         // tablets. A large Android screen must not select the desktop navbar.
-        final isNarrow = Platform.isAndroid || screenWidth < 600;
+        final isNarrow = context.isNarrow;
 
         return PopScope(
           canPop: !canGoBackSignal.value,
@@ -87,12 +171,21 @@ class _AppLayoutState extends State<AppLayout> {
                           _FloatingBackButton(),
                           const _FloatingRefreshButton(),
                           if (isCustomTitlebar)
-                            const Positioned(
+                            // Not const: WindowCaption holds a Finalizable
+                            // field, and the incremental compiler then fails
+                            // with "A const constructor can't have a body"
+                            // (dart-lang/sdk#64487).
+                            // ignore: prefer_const_constructors
+                            Positioned(
                               top: 0,
                               left: 0,
                               right: 0,
+                              // dart-lang/sdk#64487 above
+                              // ignore: prefer_const_constructors
                               child: SizedBox(
                                 height: 32,
+                                // dart-lang/sdk#64487 above
+                                // ignore: prefer_const_constructors
                                 child: WindowCaption(
                                   brightness: Brightness.dark,
                                   backgroundColor: Colors.transparent,
@@ -197,7 +290,15 @@ class _AppLayoutState extends State<AppLayout> {
             Positioned.fill(
               child: Stack(
                 children: rootSections
-                    .map((root) => _RootBucket(root: root))
+                    .map(
+                      (root) => _RootBucket(
+                        root: root,
+                        direction: _tabDirection,
+                        back: _back,
+                        backScreen: () => _backScreen,
+                        backUnder: () => _backUnder,
+                      ),
+                    )
                     .toList(),
               ),
             ),
@@ -212,8 +313,7 @@ class _AppLayoutState extends State<AppLayout> {
                       : 0.0) +
                   systemBottom,
               // While the full player covers the app, the bar keeps painting
-              // behind it (its own blur pass included). Unmount it on Android
-              // instead.
+              // behind it. Unmount it on Android instead.
               child: ValueListenableBuilder<double>(
                 valueListenable: mobileFullPlayerProgress,
                 builder: (context, progress, child) {
@@ -240,8 +340,7 @@ class _AppLayoutState extends State<AppLayout> {
           return const SizedBox.shrink();
         }
         return Align(
-          alignment: (Platform.isAndroid ||
-                  MediaQuery.sizeOf(context).width < 600)
+          alignment: (Platform.isAndroid || context.isNarrow)
               ? Alignment.bottomCenter
               : Alignment.centerLeft,
           child: ValueListenableBuilder<double>(
@@ -298,8 +397,18 @@ class _AppLayoutState extends State<AppLayout> {
 
 class _RootBucket extends StatelessWidget {
   final AppSection root;
+  final int direction;
+  final Animation<double> back;
+  final NavState? Function() backScreen;
+  final NavState? Function() backUnder;
 
-  const _RootBucket({required this.root});
+  const _RootBucket({
+    required this.root,
+    required this.direction,
+    required this.back,
+    required this.backScreen,
+    required this.backUnder,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -315,12 +424,10 @@ class _RootBucket extends StatelessWidget {
 
         return TabVisibility(
           isVisible: isVisible,
-          child: Offstage(
-            offstage: !isVisible,
-            child: TickerMode(
-              enabled: isVisible,
-              child: Stack(children: _buildWindowStack(stack)),
-            ),
+          child: TabSlide(
+            isVisible: isVisible,
+            direction: direction,
+            child: Stack(children: _buildWindowStack(stack)),
           ),
         );
       },
@@ -328,23 +435,30 @@ class _RootBucket extends StatelessWidget {
   }
 
   List<Widget> _buildWindowStack(List<NavState> stack) {
-    return stack.asMap().entries.map((entry) {
-      final index = entry.key;
-      final state = entry.value;
-      final isLast = index == stack.length - 1;
-      final isHome = state.section == AppSection.home;
+    // The tab root stays built forever (switching tabs keeps its state), plus
+    // at most two screens pushed on top of it. Anything deeper needs more than
+    // two back presses and would otherwise stay mounted - rebuilding on every
+    // signal tick - for the life of the tab.
+    final firstPushed = stack.length > 2 ? stack.length - 2 : 1;
+    return stack
+        .asMap()
+        .entries
+        .where((entry) => entry.key == 0 || entry.key >= firstPushed)
+        .map((entry) {
+          final index = entry.key;
+          final state = entry.value;
+          final isLast = index == stack.length - 1;
+          final isHome = state.section == AppSection.home;
 
-      // Keep only the current and previous screens in the tab stack
-      final isDeeplyHidden = index < stack.length - 2;
-
-      return Offstage(
-        key: ValueKey('win_${state.section}_${state.id}_$index'),
-        offstage: isDeeplyHidden,
-        child: TickerMode(
-          enabled: !isDeeplyHidden,
-          child: AnimatedOpacity(
+          // Keyed by destination, not stack position, so pushing a screen
+          // keeps the previous one's state (scroll offset) instead of
+          // rebuilding it from scratch.
+          // Own fade instead of AnimatedOpacity, so a back gesture can also
+          // raise the screen underneath while its target stays at 0.
+          return TweenAnimationBuilder<double>(
+            key: ValueKey('win_${state.section}_${state.id}'),
+            tween: Tween(begin: isLast ? 1.0 : 0.0, end: isLast ? 1.0 : 0.0),
             duration: const Duration(milliseconds: 500),
-            opacity: isLast ? 1.0 : 0.0,
             curve: Curves.easeInOutCubic,
             child: AnimatedSlide(
               duration: const Duration(milliseconds: 500),
@@ -358,14 +472,31 @@ class _RootBucket extends StatelessWidget {
                 curve: Curves.easeOutCubic,
                 child: IgnorePointer(
                   ignoring: !isLast,
-                  child: _WindowContent(state: state, index: index),
+                  child: _WindowContent(state: state),
                 ),
               ),
             ),
-          ),
-        ),
-      );
-    }).toList();
+            builder: (context, visible, child) => AnimatedBuilder(
+              animation: back,
+              child: child,
+              builder: (context, child) {
+                // The leaving screen shrinks and fades out with the finger, and
+                // the one beneath it fades in to full opacity on commit.
+                final leaving = backScreen() == state ? back.value : 0.0;
+                final revealed = backUnder() == state ? back.value : 0.0;
+                final shown = visible * (1 - leaving);
+                return Transform.scale(
+                  scale: 1 - 0.1 * leaving,
+                  child: Opacity(
+                    opacity: shown > revealed ? shown : revealed,
+                    child: child,
+                  ),
+                );
+              },
+            ),
+          );
+        })
+        .toList();
   }
 }
 
@@ -420,9 +551,8 @@ class _AnimatedPlayerBar extends StatelessWidget {
 
 class _WindowContent extends StatelessWidget {
   final NavState state;
-  final int index;
 
-  const _WindowContent({required this.state, required this.index});
+  const _WindowContent({required this.state});
 
   @override
   Widget build(BuildContext context) {
@@ -431,12 +561,11 @@ class _WindowContent extends StatelessWidget {
         final isHome = state.section == AppSection.home;
         androidAppearanceProfileSignal();
         final showLyrics = showLyricsSignal.value;
-        final screenWidth = MediaQuery.sizeOf(context).width;
-        final isNarrow = Platform.isAndroid || screenWidth < 600;
+        final isNarrow = context.isNarrow;
 
         // Bottom padding calculation to avoid overlap with PlayerBar and NavBar
         // We only apply it to the browser (yandexId) and settings (account) to prevent them from being covered,
-        // while other views scroll under the player for the blur effect.
+        // while other views keep scrolling to the very bottom.
         final hasPlayerBar = !isHome || showLyrics;
 
         double bottomPadding = 0;
@@ -453,20 +582,20 @@ class _WindowContent extends StatelessWidget {
           // Keep the wave controls and start button clear of the floating
           // Android player bar and bottom navigation.
           bottomPadding = 96 + MediaQuery.viewPaddingOf(context).bottom;
-        } else if (isHome && screenWidth < 600) {
+        } else if (isHome && isNarrow)
           // Home is centered non-scrollable content: its bottom row
           // (wave settings, repeat, quality) must stay above the floating
-          // navbar. Navbar top sits at 64 (height) + 12 (gap) +
+          // navbar. Navbar top sits at 56 (height) + 12 (gap) +
           // systemBottom above the screen bottom, plus a small gap.
           final navbarVisible = !(Platform.isAndroid && showLyrics);
           if (navbarVisible) {
-            bottomPadding = 88 + MediaQuery.viewPaddingOf(context).bottom;
+            bottomPadding = 80 + MediaQuery.viewPaddingOf(context).bottom;
           }
         }
 
         final key = state.section == AppSection.account
-            ? ValueKey('account_$index')
-            : PageStorageKey('scroll_${state.section}_${state.id}_$index');
+            ? ValueKey('account_${state.section}')
+            : PageStorageKey('scroll_${state.section}_${state.id}');
 
         final child = KeyedSubtree(
           key: key,
@@ -539,33 +668,49 @@ class _FloatingBackButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return SignalBuilder(
       builder: (context) {
-        if (!canGoBackSignal.value) return const SizedBox.shrink();
+        final canGoBack = canGoBackSignal.value;
 
         return Positioned(
           top: 60,
           left: 24,
-          child: IconButton(
-            onPressed: goBack,
-            style: IconButton.styleFrom(
-              backgroundColor: Color.lerp(
-                Theme.of(context).colorScheme.surfaceContainerHighest,
-                Colors.black,
-                0.4,
+          child: IgnorePointer(
+            ignoring: !canGoBack,
+            child: AnimatedOpacity(
+              duration: const Duration(milliseconds: 250),
+              curve: Curves.easeOutCubic,
+              opacity: canGoBack ? 1 : 0,
+              child: AnimatedScale(
+                duration: const Duration(milliseconds: 250),
+                curve: Curves.easeOutBack,
+                scale: canGoBack ? 1 : 0.6,
+                child: ExcludeFocus(
+                  excluding: !canGoBack,
+                  child: IconButton(
+                    onPressed: goBack,
+                    style: IconButton.styleFrom(
+                      backgroundColor: Color.lerp(
+                        Theme.of(context).colorScheme.surfaceContainerHighest,
+                        Colors.black,
+                        0.4,
+                      ),
+                      hoverColor: Theme.of(
+                        context,
+                      ).colorScheme.onSurface.withValues(alpha: 0.1),
+                      padding: const EdgeInsets.all(12),
+                      side: BorderSide(
+                        color: Theme.of(
+                          context,
+                        ).colorScheme.onSurface.withValues(alpha: 0.1),
+                      ),
+                    ),
+                    icon: Icon(
+                      Icons.arrow_back_ios_new_rounded,
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      size: 24,
+                    ),
+                  ),
+                ),
               ),
-              hoverColor: Theme.of(
-                context,
-              ).colorScheme.onSurface.withValues(alpha: 0.1),
-              padding: const EdgeInsets.all(12),
-              side: BorderSide(
-                color: Theme.of(
-                  context,
-                ).colorScheme.onSurface.withValues(alpha: 0.1),
-              ),
-            ),
-            icon: Icon(
-              Icons.arrow_back_ios_new_rounded,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-              size: 24,
             ),
           ),
         );
@@ -615,14 +760,15 @@ class _FloatingRefreshButtonState extends State<_FloatingRefreshButton> {
         if (!_refreshable.contains(currentNavStateSignal.value.section)) {
           return const SizedBox.shrink();
         }
-        // Without the back button take its place, otherwise sit below it.
-        final top = canGoBackSignal.value ? 120.0 : 60.0;
-        return Positioned(
-          top: top,
+        // Level with the page title (titlebar 32 + page padding 40). With the
+        // back button it moves below it, animated.
+        return AnimatedPositioned(
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOutCubic,
+          top: canGoBackSignal.value ? 120.0 : 72.0,
           left: 24,
           child: IconButton(
             onPressed: _spinning ? null : _onRefresh,
-            tooltip: 'Обновить',
             style: IconButton.styleFrom(
               backgroundColor: Color.lerp(
                 Theme.of(context).colorScheme.surfaceContainerHighest,
@@ -649,6 +795,7 @@ class _FloatingRefreshButtonState extends State<_FloatingRefreshButton> {
                     Icons.refresh_rounded,
                     color: Theme.of(context).colorScheme.onSurfaceVariant,
                     size: 24,
+                    semanticLabel: 'Обновить',
                   ),
           ),
         );

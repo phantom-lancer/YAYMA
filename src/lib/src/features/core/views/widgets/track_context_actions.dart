@@ -154,11 +154,19 @@ class TrackContextActions {
         ];
       },
       actions: [
-        const TrackSheetAction(
-          value: 'play_next',
-          label: 'Добавить следующим',
-          icon: Icons.playlist_play_rounded,
-        ),
+        // Queue actions only make sense while a track is playing.
+        if (playerStateSignal.value?.currentTrack != null) ...[
+          const TrackSheetAction(
+            value: 'play_next',
+            label: 'Играть следующим',
+            icon: Icons.queue_rounded,
+          ),
+          const TrackSheetAction(
+            value: 'add_last',
+            label: 'Добавить в конец очереди',
+            icon: Icons.playlist_add_rounded,
+          ),
+        ],
         const TrackSheetAction(
           value: 'sleep_timer',
           label: 'Таймер сна',
@@ -224,6 +232,13 @@ class TrackContextActions {
     }
 
     switch (value) {
+      // Queue additions are silent by design: the list itself is the
+      // feedback (the track appears in the queue panel), and a toast would
+      // also fire on no-op fetches where nothing was actually added.
+      case 'play_next':
+        await PlaybackController.playTrackNextInQueue(trackId);
+      case 'add_last':
+        await PlaybackController.addTrackToQueue(trackId);
       case 'like':
         await PlaybackController.toggleLike(trackId: trackId);
       case 'dislike':

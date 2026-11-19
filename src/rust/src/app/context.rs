@@ -43,43 +43,41 @@ pub struct AppContext {
 }
 
 impl AppContext {
+    /// Takes the dependency groups by name: nine positional handles made the
+    /// call site unreadable, and the groups are the same ones the context
+    /// stores, so nothing is reshaped here. The shutdown pair is created by
+    /// the caller (`initialize_services`) so the audio stack can listen to
+    /// the same channel it is spawned with.
     pub fn new(
-        audio_tx: mpsc::Sender<AudioMessage>,
-        api: Arc<ApiService>,
-        db: Arc<Mutex<AppDatabase>>,
-        http_cache: Arc<HttpCache>,
-        track_cache: Arc<TrackCache>,
-        signals: AudioSignals,
-        state: Arc<RwLock<SystemState>>,
-        effect_handles: Arc<StdRwLock<HashMap<String, EffectHandle>>>,
+        audio: AppAudioContext,
+        core: AppCoreContext,
         event_sink: Arc<OnceCell<StreamSink<AppEvent>>>,
-    ) -> (Self, watch::Receiver<bool>) {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        shutdown_tx: watch::Sender<bool>,
+    ) -> Self {
         let inner = Arc::new(AppContextInner {
-            audio: AppAudioContext {
-                tx: audio_tx,
-                signals,
-                state,
-                effect_handles,
-            },
-            core: AppCoreContext {
-                api,
-                db,
-                http_cache,
-                track_cache,
-            },
+            audio,
+            core,
             system: AppSystemContext {
                 event_sink,
                 shutdown_tx,
             },
         });
-        (Self { inner }, shutdown_rx)
+        Self { inner }
     }
 
     pub fn send_event(&self, event: AppEvent) {
         if let Some(sink) = self.inner.system.event_sink.get() {
             let _ = sink.add(event);
         }
+    }
+
+    /// Stops this session's audio stack: the actor breaks out of its loop
+    /// (running the listen-close + SMTC/controller teardown), and the watch
+    /// releases the workers. `Drop` alone can never do this — desktop
+    /// statics keep context clones alive forever — so logout must call it.
+    pub async fn shutdown(&self) {
+        let _ = self.inner.audio.tx.send(AudioMessage::Shutdown).await;
+        let _ = self.inner.system.shutdown_tx.send(true);
     }
 }
 

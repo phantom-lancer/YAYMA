@@ -5,6 +5,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:yayma/src/app/session.dart';
@@ -12,13 +13,16 @@ import 'package:yayma/src/features/core/providers/navigation_provider.dart';
 import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/providers/notification_provider.dart';
 import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
+import 'package:yayma/src/features/core/services/app_logger.dart';
 import 'package:yayma/src/features/core/services/global_hotkey_service.dart';
 import 'package:yayma/src/features/core/services/rust_bridge.dart';
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
 import 'package:yayma/src/features/core/views/widgets/responsive.dart';
+import 'package:yayma/src/features/core/views/widgets/rust_cached_image.dart';
 import 'package:yayma/src/features/core/views/widgets/smooth_scroll.dart';
 import 'package:yayma/src/features/library/providers/library_provider.dart';
+import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/features/settings/views/lyrics_providers_dialog.dart';
 import 'package:yayma/src/rust/api/content.dart' as rust;
 import 'package:yayma/src/rust/api/simple.dart' as simple;
@@ -151,6 +155,18 @@ class _SettingsViewState extends State<SettingsView> {
     );
   }
 
+  Future<void> _saveVibeStyle(VibeStyle style) async {
+    vibeStyleSignal.value = style;
+    await runRustAction(
+      (ctx) => simple.setVibeStyle(ctx: ctx, style: style.name),
+    );
+  }
+
+  String _vibeStyleSubtitle(VibeStyle style) => switch (style) {
+    VibeStyle.aurora => 'Северное сияние: мягкие полосы света в цветах обложки',
+    VibeStyle.wave => 'Волна: пульсирующие пятна света в такт музыке',
+  };
+
   Future<void> _toggleBlurEffects(bool enabled) async {
     blurEffectsEnabledSignal.value = enabled;
     await runRustAction(
@@ -189,6 +205,7 @@ class _SettingsViewState extends State<SettingsView> {
   Future<void> _clearCache() async {
     final ok = await runRustAction((ctx) => simple.clearCache(ctx: ctx));
     if (!ok) return;
+    RustCachedImage.clearPathCache();
     unawaited(_cacheSizeSignal.refresh());
     showAppSuccess('Кэш успешно очищен');
   }
@@ -202,10 +219,20 @@ class _SettingsViewState extends State<SettingsView> {
     showAppSuccess('Скачанные треки успешно удалены');
   }
 
+  Future<void> _openLogFolder() async {
+    // The log file lives in the same app-support directory Dart passes to
+    // initAppInfrastructure, so the folder is opened without a Rust roundtrip.
+    final dir = await getApplicationSupportDirectory();
+    final opened = await launchUrl(
+      Uri.file(dir.path),
+      mode: LaunchMode.externalApplication,
+    );
+    if (!opened) showAppError('Не удалось открыть папку с логами');
+  }
+
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.sizeOf(context).width;
-    final isNarrow = screenWidth < 600;
+    final isNarrow = context.isNarrow;
 
     return Scaffold(
       backgroundColor: Colors.transparent,
@@ -215,9 +242,9 @@ class _SettingsViewState extends State<SettingsView> {
           SliverToBoxAdapter(
             child: Padding(
               padding: EdgeInsets.fromLTRB(
-                isNarrow ? 20 : 40,
-                isNarrow ? 20 : 60,
-                isNarrow ? 20 : 40,
+                context.horizontalPadding,
+                isNarrow ? 16 : 40,
+                context.horizontalPadding,
                 isNarrow ? 20 : 40,
               ),
               child: const CommonPageTitle(title: 'Настройки'),
@@ -232,6 +259,8 @@ class _SettingsViewState extends State<SettingsView> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   ..._buildDownloadsAndEffects(isNarrow),
+                  const SizedBox(height: 32),
+                  ..._buildPlayback(),
                   if (context.isDesktop) ...[
                     const SizedBox(height: 32),
                     ..._buildDesktopAppearance(),
@@ -286,7 +315,7 @@ class _SettingsViewState extends State<SettingsView> {
             final profile = androidAppearanceProfileSignal.value;
             return _SettingItem(
               title: 'Стиль интерфейса',
-              subtitle: '${profile.title} - ${profile.description}',
+              subtitle: profile.title + ' - ' + profile.description,
               icon: Icons.palette_outlined,
               onTap: () {},
               trailing: SizedBox(
@@ -322,86 +351,226 @@ class _SettingsViewState extends State<SettingsView> {
       const SizedBox(height: 32),
       const _SectionTitle(title: 'Визуальные эффекты'),
       const SizedBox(height: 20),
-      // The shared PC shader is available on Android as well.
-      SignalBuilder(
-        builder: (context) {
-          final enabled = vibeVisibleSignal.value;
-          return _SettingItem(
-            title: 'Показывать анимацию волны',
-            subtitle: 'Анимация из ПК-версии в стилях Yandex и текущем',
-            icon: Icons.waves_rounded,
-            onTap: () => unawaited(_toggleVibeVisibility(!enabled)),
-            trailing: Switch(
-              value: enabled,
-              onChanged: (value) => unawaited(_toggleVibeVisibility(value)),
-            ),
-          );
-        },
-      ),
-      const SizedBox(height: 8),
-      SignalBuilder(
-        builder: (context) {
-          final scale = vibeRenderScaleSignal.value;
-          return _SettingItem(
-            title: 'Разрешение волны',
-            subtitle:
-                '${(scale * 100).round()}% — выше качество, выше нагрузка',
-            icon: Icons.high_quality_rounded,
-            onTap: () {},
-            trailing: SizedBox(
-              width: isNarrow ? 120 : 200,
-              child: M3ESlider(
-                value: scale,
-                min: minVibeRenderScale,
-                max: maxVibeRenderScale,
-                divisions: 5,
-                label: '${(scale * 100).round()}%',
-                onChanged: vibeVisibleSignal.value
-                    ? (value) {
-                        vibeRenderScaleSignal.value = value;
-                      }
-                    : null,
-                onChangeEnd: (value) =>
-                    unawaited(_saveVibeRenderScale(value)),
+      if (Platform.isAndroid) ...[
+        SignalBuilder(
+          builder: (context) {
+            final enabled = vibeVisibleSignal.value;
+            return _SettingItem(
+              title: 'Показывать анимацию волны',
+              subtitle: 'Анимация из ПК-версии в стилях Yandex и текущем',
+              icon: Icons.waves_rounded,
+              onTap: () => unawaited(_toggleVibeVisibility(!enabled)),
+              trailing: Switch(
+                value: enabled,
+                onChanged: (value) => unawaited(_toggleVibeVisibility(value)),
               ),
+            );
+          },
+        ),
+        const SizedBox(height: 8),
+        SignalBuilder(
+          builder: (context) {
+            final scale = vibeRenderScaleSignal.value;
+            return _SettingItem(
+              title: 'Разрешение волны',
+              subtitle: (scale * 100).round().toString() +
+                  '% — выше качество, выше нагрузка',
+              icon: Icons.high_quality_rounded,
+              onTap: () {},
+              trailing: SizedBox(
+                width: isNarrow ? 120 : 200,
+                child: M3ESlider(
+                  value: scale,
+                  min: minVibeRenderScale,
+                  max: maxVibeRenderScale,
+                  divisions: 5,
+                  label: (scale * 100).round().toString() + '%',
+                  onChanged: vibeVisibleSignal.value
+                      ? (value) {
+                          vibeRenderScaleSignal.value = value;
+                        }
+                      : null,
+                  onChangeEnd: (value) =>
+                      unawaited(_saveVibeRenderScale(value)),
+                ),
+              ),
+            );
+          },
+        ),
+        const SizedBox(height: 8),
+        SignalBuilder(
+          builder: (context) {
+            final enabled = blurEffectsEnabledSignal.value;
+            return _SettingItem(
+              title: 'Размытие интерфейса',
+              subtitle: 'Размывать фон под панелями управления',
+              icon: Icons.blur_on_rounded,
+              onTap: () => unawaited(_toggleBlurEffects(!enabled)),
+              trailing: Switch(
+                value: enabled,
+                onChanged: (value) => unawaited(_toggleBlurEffects(value)),
+              ),
+            );
+          },
+        ),
+        const SizedBox(height: 8),
+        SignalBuilder(
+          builder: (context) {
+            final enabled = liquidGlassV2EnabledSignal.value;
+            return _SettingItem(
+              title: 'Liquid Glass v2',
+              subtitle:
+                  'Многослойное стекло, блики и глубокое размытие в меню и уведомлениях',
+              icon: Icons.blur_circular_rounded,
+              onTap: () => unawaited(_toggleLiquidGlassV2(!enabled)),
+              trailing: Switch(
+                value: enabled,
+                onChanged: (value) => unawaited(_toggleLiquidGlassV2(value)),
+              ),
+            );
+          },
+        ),
+      ] else ...[
+        SignalBuilder(
+          builder: (context) {
+            final enabled = vibeVisibleSignal.value;
+            return _SettingItem(
+              title: 'Показывать фон',
+              subtitle: 'Динамический фон, реагирующий на музыку',
+              icon: Icons.waves_rounded,
+              onTap: () => unawaited(_toggleVibeVisibility(!enabled)),
+              trailing: Switch(
+                value: enabled,
+                onChanged: (value) => unawaited(_toggleVibeVisibility(value)),
+              ),
+            );
+          },
+        ),
+        SignalBuilder(
+          builder: (context) {
+            final style = vibeStyleSignal.value;
+            final narrow = context.isNarrow;
+            final colorScheme = Theme.of(context).colorScheme;
+            return _SettingItem(
+              title: 'Стиль фона',
+              subtitle: _vibeStyleSubtitle(style),
+              icon: Icons.auto_awesome_rounded,
+              onTap: () {},
+              trailing: SegmentedButton<VibeStyle>(
+                segments: [
+                  for (final option in VibeStyle.values)
+                    ButtonSegment(
+                      value: option,
+                      icon: Icon(
+                        option == VibeStyle.aurora
+                            ? Icons.auto_awesome_rounded
+                            : Icons.graphic_eq_rounded,
+                      ),
+                      label: narrow ? null : Text(option.label),
+                    ),
+                ],
+                selected: {style},
+                showSelectedIcon: false,
+                style: SegmentedButton.styleFrom(
+                  selectedBackgroundColor: colorScheme.primary,
+                  selectedForegroundColor: colorScheme.onPrimary,
+                  foregroundColor: colorScheme.onSurfaceVariant,
+                  side: BorderSide(
+                    color: colorScheme.outline.withValues(alpha: 0.5),
+                  ),
+                ),
+                onSelectionChanged: vibeVisibleSignal.value
+                    ? (selection) =>
+                        unawaited(_saveVibeStyle(selection.first))
+                    : null,
+              ),
+            );
+          },
+        ),
+        const SizedBox(height: 8),
+        SignalBuilder(
+          builder: (context) {
+            final scale = vibeRenderScaleSignal.value;
+            return _SettingItem(
+              title: 'Разрешение фона',
+              subtitle: (scale * 100).round().toString() +
+                  '% — выше качество, выше нагрузка',
+              icon: Icons.high_quality_rounded,
+              onTap: () {},
+              trailing: SizedBox(
+                width: isNarrow ? 120 : 200,
+                child: M3ESlider(
+                  value: scale,
+                  min: minVibeRenderScale,
+                  max: maxVibeRenderScale,
+                  divisions: 5,
+                  label: (scale * 100).round().toString() + '%',
+                  onChanged: vibeVisibleSignal.value
+                      ? (value) {
+                          vibeRenderScaleSignal.value = value;
+                        }
+                      : null,
+                  onChangeEnd: (value) =>
+                      unawaited(_saveVibeRenderScale(value)),
+                ),
+              ),
+            );
+          },
+        ),
+        const SizedBox(height: 8),
+      ],
+    ];
+  }
+
+  List<Widget> _buildPlayback() {
+    return [
+      const _SectionTitle(title: 'Воспроизведение'),
+      const SizedBox(height: 20),
+      SignalBuilder(
+        builder: (context) {
+          final enabled = crossfadeEnabledSignal.value;
+          return _SettingItem(
+            title: 'Кроссфейд',
+            subtitle: 'Плавный переход между треками',
+            icon: Icons.graphic_eq_rounded,
+            onTap: () => unawaited(_saveCrossfade(!enabled)),
+            trailing: Switch(
+              value: enabled,
+              onChanged: (value) => unawaited(_saveCrossfade(value)),
             ),
           );
         },
       ),
-      const SizedBox(height: 8),
       SignalBuilder(
         builder: (context) {
-          final enabled = blurEffectsEnabledSignal.value;
+          final enabled = aiContentReductionSignal.value;
           return _SettingItem(
-            title: 'Размытие интерфейса',
-            subtitle: 'Размывать фон под панелями управления',
-            icon: Icons.blur_on_rounded,
-            onTap: () => unawaited(_toggleBlurEffects(!enabled)),
+            title: 'Меньше ИИ',
+            subtitle: 'Меньше сгенерированных ИИ треков в рекомендациях',
+            icon: Icons.auto_awesome_rounded,
+            onTap: () => unawaited(_saveAiContentReduction(!enabled)),
             trailing: Switch(
               value: enabled,
-              onChanged: (value) => unawaited(_toggleBlurEffects(value)),
-            ),
-          );
-        },
-      ),
-      const SizedBox(height: 8),
-      SignalBuilder(
-        builder: (context) {
-          final enabled = liquidGlassV2EnabledSignal.value;
-          return _SettingItem(
-            title: 'Liquid Glass v2',
-            subtitle:
-                'Многослойное стекло, блики и глубокое размытие в меню и уведомлениях',
-            icon: Icons.blur_circular_rounded,
-            onTap: () => unawaited(_toggleLiquidGlassV2(!enabled)),
-            trailing: Switch(
-              value: enabled,
-              onChanged: (value) => unawaited(_toggleLiquidGlassV2(value)),
+              onChanged: (value) => unawaited(_saveAiContentReduction(value)),
             ),
           );
         },
       ),
     ];
+  }
+
+  Future<void> _saveCrossfade(bool enabled) async {
+    crossfadeEnabledSignal.value = enabled;
+    await runRustAction(
+      (ctx) => simple.setCrossfade(ctx: ctx, enabled: enabled),
+    );
+  }
+
+  Future<void> _saveAiContentReduction(bool enabled) async {
+    aiContentReductionSignal.value = enabled;
+    await runRustAction(
+      (ctx) => simple.setAiContentReduction(ctx: ctx, enabled: enabled),
+    );
   }
 
   List<Widget> _buildDesktopAppearance() {
@@ -493,6 +662,13 @@ class _SettingsViewState extends State<SettingsView> {
             ),
           );
         },
+      ),
+      const SizedBox(height: 8),
+      _SettingItem(
+        title: 'Открыть папку логов',
+        subtitle: 'Открыть папку с файлом журнала приложения для диагностики',
+        icon: Icons.folder_open_rounded,
+        onTap: () => unawaited(_openLogFolder()),
       ),
     ];
   }
@@ -827,9 +1003,11 @@ class _HotkeySettingRow extends StatelessWidget {
             ),
           ),
           IconButton(
-            tooltip: 'Изменить сочетание',
             onPressed: onEdit,
-            icon: const Icon(Icons.edit_rounded),
+            icon: const Icon(
+              Icons.edit_rounded,
+              semanticLabel: 'Изменить сочетание',
+            ),
           ),
           Switch(value: binding.enabled, onChanged: onEnabledChanged),
         ],
@@ -1054,7 +1232,7 @@ class _AboutAppCard extends StatelessWidget {
         return;
       }
     } on Object catch (e) {
-      debugPrint('Error opening repository page: $e');
+      appLog(AppLogLevel.warn, 'error opening repository page: $e');
     }
     showAppError('Не удалось открыть страницу проекта');
   }
@@ -1208,8 +1386,11 @@ class _AboutAppCard extends StatelessWidget {
     if (isNarrow) {
       return IconButton.filledTonal(
         onPressed: () => unawaited(_openRepo()),
-        tooltip: 'Страница проекта на GitHub',
-        icon: const Icon(Icons.code_rounded, size: 20),
+        icon: const Icon(
+          Icons.code_rounded,
+          size: 20,
+          semanticLabel: 'Страница проекта на GitHub',
+        ),
       );
     }
     return M3EOutlinedButton.icon(
@@ -1259,94 +1440,64 @@ class _SettingItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
+    final primaryColor = Theme.of(context).colorScheme.primary;
+    final onSurfaceVariant = Theme.of(context).colorScheme.onSurfaceVariant;
+    final onSurface = Theme.of(context).colorScheme.onSurface;
     final isNarrow = context.isNarrow;
-    final radius = BorderRadius.circular(AppRadius.lg);
-
-    return Material(
-      color: Colors.transparent,
-      borderRadius: radius,
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: radius,
-        splashColor: scheme.primary.withValues(alpha: 0.10),
-        highlightColor: scheme.onSurface.withValues(alpha: 0.035),
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 180),
-          curve: Curves.easeOutCubic,
-          padding: EdgeInsets.symmetric(
-            horizontal: isNarrow ? 12 : 16,
-            vertical: isNarrow ? 11 : 13,
-          ),
-          decoration: BoxDecoration(
-            color: scheme.surfaceContainerHigh.withValues(alpha: 0.30),
-            borderRadius: radius,
-            border: Border.all(
-              color: scheme.onSurface.withValues(alpha: 0.075),
+    return InkWell(
+      onTap: onTap,
+      onHover: (_) {},
+      hoverColor: onSurface.withValues(alpha: 0.06),
+      borderRadius: BorderRadius.circular(AppRadius.sm),
+      child: Padding(
+        padding: EdgeInsets.symmetric(
+          horizontal: isNarrow ? 8 : 12,
+          vertical: isNarrow ? 8 : 10,
+        ),
+        child: Row(
+          children: [
+            Container(
+              padding: EdgeInsets.all(isNarrow ? 8 : 10),
+              decoration: BoxDecoration(
+                color: primaryColor.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(AppRadius.sm),
+              ),
+              child: Icon(icon, color: primaryColor, size: isNarrow ? 20 : 22),
             ),
-          ),
-          child: Row(
-            children: [
-              Container(
-                width: isNarrow ? 40 : 44,
-                height: isNarrow ? 40 : 44,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [
-                      scheme.primary.withValues(alpha: 0.20),
-                      scheme.primary.withValues(alpha: 0.07),
-                    ],
-                  ),
-                  borderRadius: BorderRadius.circular(AppRadius.md),
-                  border: Border.all(
-                    color: scheme.primary.withValues(alpha: 0.13),
-                  ),
-                ),
-                child: Icon(
-                  icon,
-                  color: scheme.primary,
-                  size: isNarrow ? 20 : 22,
-                ),
-              ),
-              SizedBox(width: isNarrow ? 12 : 16),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      title,
-                      style: TextStyle(
-                        color: scheme.onSurface,
-                        fontSize: isNarrow ? 14 : 15,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: -0.1,
-                      ),
+            SizedBox(width: isNarrow ? 12 : 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: TextStyle(
+                      color: onSurface,
+                      fontSize: isNarrow ? 15 : 16,
+                      fontWeight: FontWeight.w600,
                     ),
-                    const SizedBox(height: 4),
-                    Text(
-                      subtitle,
-                      style: TextStyle(
-                        color: scheme.onSurfaceVariant,
-                        fontSize: isNarrow ? 11.5 : 12.5,
-                        height: 1.3,
-                      ),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ],
-                ),
-              ),
-              SizedBox(width: isNarrow ? 8 : 12),
-              trailing ??
-                  Icon(
-                    Icons.chevron_right_rounded,
-                    color: scheme.onSurfaceVariant,
-                    size: isNarrow ? 22 : 24,
                   ),
-            ],
-          ),
+                  const SizedBox(height: 3),
+                  Text(
+                    subtitle,
+                    style: TextStyle(
+                      color: onSurfaceVariant,
+                      fontSize: isNarrow ? 12 : 14,
+                    ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ),
+            ),
+            SizedBox(width: isNarrow ? 8 : 12),
+            trailing ??
+                Icon(
+                  Icons.chevron_right_rounded,
+                  color: onSurfaceVariant,
+                  size: isNarrow ? 22 : 24,
+                ),
+          ],
         ),
       ),
     );

@@ -1,19 +1,20 @@
+import 'dart:async';
 import 'dart:io';
-import 'dart:ui' as ui;
 
-import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
-import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
 import 'package:yayma/src/features/core/views/layout/mobile_mini_player.dart';
 import 'package:yayma/src/features/core/views/widgets/app_cover.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
 import 'package:yayma/src/features/core/views/widgets/hover_scale.dart';
+import 'package:yayma/src/features/core/views/widgets/morphing_play_button.dart';
 import 'package:yayma/src/features/core/views/widgets/quality_selector.dart';
+import 'package:yayma/src/features/core/views/widgets/responsive.dart';
 import 'package:yayma/src/features/core/views/widgets/track_elements.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
+import 'package:yayma/src/features/playback/views/queue_panel.dart';
 import 'package:yayma/src/rust/api/models.dart';
 
 class PlayerBar extends StatelessWidget {
@@ -25,13 +26,6 @@ class PlayerBar extends StatelessWidget {
       builder: (context) {
         final theme = Theme.of(context);
         final colorScheme = theme.colorScheme;
-        final navState = currentNavStateSignal.value;
-        final showLyrics = showLyricsSignal.value;
-        final isHome = navState.section == AppSection.home;
-
-        final useLyricsStyle = isHome && showLyrics;
-        final alpha = useLyricsStyle ? 0.5 : 0.9;
-        final blur = useLyricsStyle ? 0.0 : 2.0;
 
         // Dynamic background color based on theme
         final barColor =
@@ -45,7 +39,9 @@ class PlayerBar extends StatelessWidget {
         return LayoutBuilder(
           builder: (context, constraints) {
             final width = constraints.maxWidth;
-            if (width < 600) {
+            // Touch layout: Android only, since the desktop window minimum is
+            // wider than the compact breakpoint.
+            if (context.isNarrow) {
               return const MobileMiniPlayer();
             }
 
@@ -53,17 +49,15 @@ class PlayerBar extends StatelessWidget {
             double coverSize = 75;
             double volumeWidth = 120;
 
-            if (width < 1100) {
+            // Only reachable from 800dp up: the desktop window minimum is
+            // 800x600, so there is no step below 900.
+            if (width < wideBreakpoint) {
               coverSize = 64;
               volumeWidth = 100;
             }
-            if (width < 900) {
+            if (width < mediumBreakpoint) {
               coverSize = 56;
               volumeWidth = 80;
-            }
-            if (width < 750) {
-              coverSize = 48;
-              volumeWidth = 60;
             }
 
             return AnimatedContainer(
@@ -72,37 +66,30 @@ class PlayerBar extends StatelessWidget {
               padding: const EdgeInsets.symmetric(horizontal: 24),
               margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
               decoration: BoxDecoration(
-                color: barColor.withValues(alpha: alpha),
+                color: barColor,
                 borderRadius: BorderRadius.circular(AppRadius.xl),
                 border: Border.all(
                   color: colorScheme.onSurface.withValues(alpha: 0.08),
                 ),
               ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(AppRadius.xl),
-                child: BackdropFilter(
-                  enabled: blurEffectsEnabledSignal.value && blur > 0,
-                  filter: ui.ImageFilter.blur(sigmaX: blur, sigmaY: blur),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        flex: 3,
-                        child: _TrackInfo(coverSize: coverSize),
-                      ),
-                      Expanded(
-                        flex: 4,
-                        child: _PlayerControls(accentColor: accentColor),
-                      ),
-                      Expanded(
-                        flex: 3,
-                        child: _VolumeAndQuality(
-                          accentColor: accentColor,
-                          volumeWidth: volumeWidth,
-                        ),
-                      ),
-                    ],
+              child: Row(
+                children: [
+                  Expanded(
+                    flex: 3,
+                    child: _TrackInfo(coverSize: coverSize),
                   ),
-                ),
+                  Expanded(
+                    flex: 4,
+                    child: _PlayerControls(accentColor: accentColor),
+                  ),
+                  Expanded(
+                    flex: 3,
+                    child: _VolumeAndQuality(
+                      accentColor: accentColor,
+                      volumeWidth: volumeWidth,
+                    ),
+                  ),
+                ],
               ),
             );
           },
@@ -278,6 +265,8 @@ class _PlayerControls extends StatelessWidget {
         final repeatMode = repeatModeSignal();
         final showBuffering = showBufferingIndicatorSignal.value;
         final onSurfaceVariant = Theme.of(context).colorScheme.onSurfaceVariant;
+        // The rotor session owns the wave queue: shuffle/repeat are disabled.
+        final isWaveActive = isWaveActiveSignal();
 
         var repeatIcon = Icons.repeat;
         if (repeatMode == RepeatModeDto.single) {
@@ -309,9 +298,15 @@ class _PlayerControls extends StatelessWidget {
                         icon: Icon(
                           Icons.shuffle,
                           size: 20,
-                          color: isShuffled ? accentColor : onSurfaceVariant,
+                          color: isWaveActive
+                              ? onSurfaceVariant.withValues(alpha: 0.38)
+                              : isShuffled
+                              ? accentColor
+                              : onSurfaceVariant,
                         ),
-                        onPressed: PlaybackController.toggleShuffle,
+                        onPressed: isWaveActive
+                            ? null
+                            : PlaybackController.toggleShuffle,
                       ),
                       IconButton(
                         icon: Icon(
@@ -331,39 +326,11 @@ class _PlayerControls extends StatelessWidget {
                         icon: Icon(Icons.skip_previous_rounded, size: 28),
                         onPressed: PlaybackController.prev,
                       ),
-                      IconButton(
-                        iconSize: 48,
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(
-                          minWidth: 48,
-                          minHeight: 48,
-                        ),
-                        icon: showBuffering
-                            ? M3ECircularWavyProgressIndicator(
-                                strokeWidth: 3,
-                                size: 40,
-                                color: accentColorSignal.value,
-                              )
-                            : AnimatedSwitcher(
-                                duration: const Duration(milliseconds: 250),
-                                switchInCurve: Curves.easeOutBack,
-                                switchOutCurve: Curves.easeIn,
-                                transitionBuilder: (child, animation) {
-                                  return FadeTransition(
-                                    opacity: animation,
-                                    child: ScaleTransition(
-                                      scale: animation,
-                                      child: child,
-                                    ),
-                                  );
-                                },
-                                child: Icon(
-                                  isPlaying
-                                      ? Icons.pause_circle_filled_rounded
-                                      : Icons.play_circle_filled_rounded,
-                                  key: ValueKey<bool>(isPlaying),
-                                ),
-                              ),
+                      MorphingPlayPauseButton(
+                        isPlaying: isPlaying,
+                        isBuffering: showBuffering,
+                        size: 48,
+                        color: accentColorSignal.value,
                         onPressed: PlaybackController.togglePlay,
                       ),
                       const IconButton(
@@ -383,13 +350,24 @@ class _PlayerControls extends StatelessWidget {
                         icon: Icon(
                           repeatIcon,
                           size: 20,
-                          color: repeatMode != RepeatModeDto.none
+                          color: isWaveActive
+                              ? onSurfaceVariant.withValues(alpha: 0.38)
+                              : repeatMode != RepeatModeDto.none
                               ? accentColor
                               : onSurfaceVariant,
                         ),
-                        onPressed: PlaybackController.toggleRepeat,
+                        onPressed: isWaveActive
+                            ? null
+                            : PlaybackController.toggleRepeat,
                       ),
-                      CommonQualitySelector(accentColor: accentColor),
+                      IconButton(
+                        icon: Icon(
+                          Icons.queue_music_rounded,
+                          size: 20,
+                          color: onSurfaceVariant,
+                        ),
+                        onPressed: () => unawaited(showQueuePanel(context)),
+                      ),
                     ],
                   ),
                 ),
@@ -427,8 +405,10 @@ class _VolumeAndQuality extends StatelessWidget {
             Icon(Icons.volume_up_rounded, size: 18, color: onSurfaceVariant),
             CommonVolumeSlider(width: volumeWidth, activeColor: accentColor),
             const SizedBox(width: 8),
-            const AudioDeviceButton(),
           ],
+          // Sound settings (quality + output device) in the corner, where
+          // the standalone device button used to sit.
+          CommonQualitySelector(accentColor: accentColor),
         ],
       ),
     );

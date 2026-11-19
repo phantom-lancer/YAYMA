@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
 
+import 'package:flutter/physics.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/app/init.dart';
@@ -10,8 +11,10 @@ import 'package:yayma/src/features/auth/views/yandex_id_view.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
 import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
+
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
+import 'package:yayma/src/features/core/views/widgets/responsive.dart';
 import 'package:yayma/src/features/core/views/widgets/rust_cached_image.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/features/playback/providers/wave_provider.dart';
@@ -112,11 +115,20 @@ class _FloatingNavBarState extends State<FloatingNavBar>
             _isNavbarHovered ||
             _isHovered ||
             _isAccountMenuOpen;
-        final isNarrow = Platform.isAndroid || MediaQuery.sizeOf(context).width < 600;
+        final isNarrow = Platform.isAndroid || context.isNarrow;
         // Edge-to-edge: app draws behind the Android system navigation bar,
         // so lift the floating navbar above the 3-button/gesture bar.
         // viewPadding stays stable when the keyboard opens.
         final systemBottom = MediaQuery.viewPaddingOf(context).bottom;
+
+        // The revealed label shares the bar with the icon slots (56 each) and
+        // the bar hugs its content, so cap the label or the row overflows on a
+        // small phone: 48 bar margins + 24 bar padding + 16 label gap.
+        final slots = 3 + (isDesktop ? 1 : 0);
+        final labelMaxWidth = isNarrow
+            ? MediaQuery.sizeOf(context).width - 48 - 24 - slots * 56 - 16
+            : 0.0;
+
 
         final children = [
           if (isDesktop)
@@ -175,12 +187,16 @@ class _FloatingNavBarState extends State<FloatingNavBar>
           if (!Platform.isAndroid)
             _NavIcon(
               icon: Icons.home_rounded,
+              label: 'Главная',
+              maxLabelWidth: labelMaxWidth,
               isSelected: currentSection == AppSection.home,
               onTap: () => setSection(AppSection.home),
               isNarrow: isNarrow,
             ),
           _NavIcon(
             icon: Icons.search_rounded,
+            label: 'Поиск',
+            maxLabelWidth: labelMaxWidth,
             isSelected: currentSection == AppSection.search,
             onTap: () => setSection(AppSection.search),
             isNarrow: isNarrow,
@@ -195,6 +211,8 @@ class _FloatingNavBarState extends State<FloatingNavBar>
             ),
           _NavIcon(
             icon: Icons.library_music_rounded,
+            label: 'Библиотека',
+            maxLabelWidth: labelMaxWidth,
             isSelected:
                 currentSection == AppSection.liked ||
                 currentSection == AppSection.playlists,
@@ -410,7 +428,7 @@ class _AccountMenuDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isNarrow = MediaQuery.sizeOf(context).width < 600;
+    final isNarrow = context.isNarrow;
 
     return Dialog(
       alignment: isNarrow ? Alignment.bottomCenter : Alignment.centerLeft,
@@ -639,7 +657,7 @@ class _WaveOverlayState extends State<_WaveOverlay>
   @override
   Widget build(BuildContext context) {
     final screenWidth = MediaQuery.sizeOf(context).width;
-    final isNarrow = screenWidth < 600;
+    final isNarrow = context.isNarrow;
 
     return Positioned(
       width: isNarrow ? screenWidth - 48 : 480,
@@ -679,60 +697,188 @@ class _WaveOverlayState extends State<_WaveOverlay>
   }
 }
 
-class _NavIcon extends StatelessWidget {
+class _NavIcon extends StatefulWidget {
   final IconData icon;
+  final String? label;
+  final double maxLabelWidth;
+  final String? tooltip;
   final bool isSelected;
   final VoidCallback onTap;
   final bool isNarrow;
-  final String? tooltip;
 
   const _NavIcon({
     required this.icon,
+    this.label,
+    this.maxLabelWidth = 0,
+    this.tooltip,
     required this.isSelected,
     required this.onTap,
     this.isNarrow = false,
-    this.tooltip,
   });
 
   @override
+  State<_NavIcon> createState() => _NavIconState();
+}
+
+class _NavIconState extends State<_NavIcon> with TickerProviderStateMixin {
+  // Material 3 Expressive motion tokens, same split as Compose: size and
+  // position run on the spatial spring (it overshoots), colour and alpha on a
+  // critically damped one (they must not). See ExpressiveMotionTokens.
+  static const _spatialSpring = SpringDescription(
+    mass: 1,
+    stiffness: 380,
+    damping: 31.2, // 2 * 0.8 * sqrt(380)
+  );
+  static const _effectsSpring = SpringDescription(
+    mass: 1,
+    stiffness: 1600,
+    damping: 80, // 2 * 1.0 * sqrt(1600)
+  );
+
+  late final _spatial = AnimationController.unbounded(
+    vsync: this,
+    value: widget.isSelected ? 1 : 0,
+  );
+  late final _effects = AnimationController.unbounded(
+    vsync: this,
+    value: widget.isSelected ? 1 : 0,
+  );
+  late final _progress = Listenable.merge([_spatial, _effects]);
+
+  void _settle(AnimationController controller, SpringDescription spring) {
+    final target = widget.isSelected ? 1.0 : 0.0;
+    // Interrupting keeps the current velocity, like animate*AsState does.
+    unawaited(
+      controller
+          .animateWith(
+            SpringSimulation(
+              spring,
+              controller.value,
+              target,
+              controller.velocity,
+            ),
+          )
+          // A spring only approaches the target; land exactly, as Compose does.
+          .whenComplete(() {
+            if (!controller.isAnimating) controller.value = target;
+          }),
+    );
+  }
+
+  @override
+  void didUpdateWidget(_NavIcon oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.isSelected == widget.isSelected) return;
+    _settle(_spatial, _spatialSpring);
+    _settle(_effects, _effectsSpring);
+  }
+
+  @override
+  void dispose() {
+    _spatial.dispose();
+    _effects.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: EdgeInsets.symmetric(
-        vertical: isNarrow ? 0 : 4,
-        horizontal: isNarrow ? 4 : 0,
-      ),
-      child: AnimatedScale(
-        scale: isSelected ? 1.12 : 1.0,
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeOutBack,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOutCubic,
+    // The flying label is the Android bottom bar treatment; the desktop rail
+    // (and narrow desktop windows) stay icon-only.
+    final labelsInline =
+        widget.isNarrow &&
+        Theme.of(context).platform == TargetPlatform.android &&
+        widget.label != null;
+    final pill = AnimatedBuilder(
+      animation: _progress,
+      builder: (context, _) {
+        final scheme = Theme.of(context).colorScheme;
+        // Layout stops at the target so the hugging bar cannot overflow; the
+        // spatial spring's overshoot stays visible in the shape.
+        final t = _spatial.value.clamp(0.0, 1.0);
+        final e = _effects.value.clamp(0.0, 1.0);
+        final color = Color.lerp(
+          scheme.onSurface.withValues(alpha: 0.38),
+          scheme.primary,
+          e,
+        )!;
+        final iconButton = SizedBox(
           width: 48,
           height: 48,
-          decoration: BoxDecoration(
-            color: isSelected
-                ? scheme.primary.withValues(alpha: 0.18)
-                : Colors.transparent,
-            borderRadius: BorderRadius.circular(isSelected ? 16 : 14),
-            border: isSelected
-                ? Border.all(color: scheme.primary.withValues(alpha: 0.35))
-                : null,
-          ),
           child: IconButton(
-            tooltip: tooltip,
-            onPressed: onTap,
-            icon: Icon(
-              icon,
-              color: isSelected
-                  ? scheme.primary
-                  : scheme.onSurface.withValues(alpha: 0.38),
-              size: 28,
+            tooltip: widget.tooltip,
+            onPressed: widget.onTap,
+            // On the phone the pill itself is the touch feedback; the ink
+            // splash would paint a second, mismatched highlight over it.
+            style: labelsInline
+                ? IconButton.styleFrom(
+                    splashFactory: NoSplash.splashFactory,
+                    overlayColor: Colors.transparent,
+                  )
+                : null,
+            icon: Icon(widget.icon, color: color, size: 28),
+          ),
+        );
+        return Container(
+          width: widget.isNarrow ? null : 48,
+          height: 48,
+          decoration: BoxDecoration(
+            color: scheme.primary.withValues(alpha: 0.18 * e),
+            // 24 is half the pill height, i.e. a full capsule: AppRadius.full
+            // would saturate on the first frame and snap.
+            borderRadius: BorderRadius.circular(14 + 10 * _spatial.value),
+            border: Border.all(
+              color: scheme.primary.withValues(alpha: 0.35 * e),
+
             ),
           ),
-        ),
+          child: labelsInline
+              ? Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    iconButton,
+                    Flexible(
+                      // Always in the tree so it can slide back in: Compose
+                      // never fades this label, it only reveals it.
+                      child: ClipRect(
+                        child: Align(
+                          alignment: Alignment.centerLeft,
+                          widthFactor: t,
+                          child: Padding(
+                            padding: const EdgeInsets.only(right: 16),
+                            child: ConstrainedBox(
+                              constraints: BoxConstraints(
+                                maxWidth: widget.maxLabelWidth,
+                              ),
+                              child: Text(
+                                widget.label ?? '',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w600,
+                                  color: color,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                )
+              : iconButton,
+        );
+      },
+    );
+
+    return Padding(
+      padding: EdgeInsets.symmetric(
+        vertical: widget.isNarrow ? 0 : 4,
+        horizontal: widget.isNarrow ? 4 : 0,
       ),
+      child: widget.isNarrow
+          ? pill
+          : Transform.scale(scale: 1 + 0.12 * _spatial.value, child: pill),
     );
   }
 }

@@ -35,9 +35,8 @@ jobs:
           java-version: '21'
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.97.1
           targets: aarch64-linux-android
 
       - name: Setup Rust Cache

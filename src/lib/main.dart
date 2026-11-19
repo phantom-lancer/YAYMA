@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' show PlatformDispatcher;
 
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
@@ -11,12 +12,41 @@ import 'package:yayma/src/app/window_placement.dart';
 import 'package:yayma/src/features/auth/views/auth/auth_screens.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
 import 'package:yayma/src/features/core/providers/notification_provider.dart';
+import 'package:yayma/src/features/core/services/app_logger.dart';
 import 'package:yayma/src/features/core/services/global_hotkey_service.dart';
 import 'package:yayma/src/features/core/theme/app_theme.dart';
+import 'package:yayma/src/features/core/views/widgets/keyboard_focus.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Covers are cached on disk and decoded at display size, so a smaller cap
+  // only costs a re-decode; the 100 MiB default is most of the app's RAM use.
+  PaintingBinding.instance.imageCache.maximumSizeBytes = 64 << 20;
+
+  // Without these an exception during init or in a detached future only
+  // reaches the console, leaving the user on a spinner with no explanation.
+  FlutterError.onError = (details) {
+    FlutterError.presentError(details);
+    debugPrint('Uncaught Flutter error: ${details.exception}');
+    // Short stack excerpt keeps the single log line readable.
+    final stackExcerpt = details.stack
+        ?.toString()
+        .split('\n')
+        .take(4)
+        .join(' ');
+    appLog(
+      AppLogLevel.error,
+      'Uncaught Flutter error: ${details.exception}'
+      '${stackExcerpt == null ? '' : ' | stack: $stackExcerpt'}',
+    );
+  };
+  PlatformDispatcher.instance.onError = (error, stack) {
+    debugPrint('Uncaught async error: $error\n$stack');
+    appLog(AppLogLevel.error, 'Uncaught async error: $error');
+    return true;
+  };
 
   final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
   if (!isDesktop) {
@@ -33,57 +63,57 @@ Future<void> main() async {
     );
   }
   final appInitialization = AppInit.initialize();
-  final windowInitialization = isDesktop
-      ? windowManager.ensureInitialized()
-      : Future<void>.value();
 
   runApp(const MyApp());
 
-  await Future.wait([appInitialization, windowInitialization]);
+  await appInitialization;
 
-  Future<void>? windowReady;
+  Window? mainWindow;
   if (isDesktop) {
-    final isCustom = customTitlebarSignal.value;
-    customTitlebarSignal.value = isCustom;
+    final window = WindowManager.instance.getCurrent();
+    if (window != null) {
+      final isCustom = customTitlebarSignal.value;
 
-    final savedBounds = await WindowPlacement.loadBounds();
-    final savedMaximized = await WindowPlacement.loadMaximized();
-    // On Wayland the compositor owns positioning; on other platforms the
-    // saved monitor may be gone — in both cases restore size and center.
-    final restoreBounds =
-        savedBounds != null &&
-            !WindowPlacement.isWayland &&
-            await WindowPlacement.isPositionVisible(savedBounds)
-        ? savedBounds
-        : null;
+      final saved = await WindowPlacement.loadState();
+      final savedBounds = saved.bounds;
+      final savedMaximized = saved.maximized;
+      // On Wayland the compositor owns positioning; on other platforms the
+      // saved monitor may be gone — in both cases restore size and center.
+      final restoreBounds =
+          savedBounds != null &&
+              !WindowPlacement.isWayland &&
+              await WindowPlacement.isPositionVisible(savedBounds)
+          ? savedBounds
+          : null;
 
-    final windowOptions = WindowOptions(
-      size: savedBounds?.size ?? WindowPlacement.defaultSize,
-      minimumSize: WindowPlacement.minimumSize,
-      center: restoreBounds == null,
-      backgroundColor: Colors.transparent,
-      skipTaskbar: false,
-      titleBarStyle: isCustom ? TitleBarStyle.hidden : TitleBarStyle.normal,
-    );
-    windowReady = windowManager.waitUntilReadyToShow(windowOptions, () async {
+      window
+        ..titleBarStyle = isCustom ? TitleBarStyle.hidden : TitleBarStyle.normal
+        ..minimumSize = WindowPlacement.minimumSize.toNative()
+        ..backgroundColor = const Color(0x00000000).toNative()
+        ..isVisibleInTaskbar = true
+        ..setSize(
+          (savedBounds?.size ?? WindowPlacement.defaultSize).toNative(),
+          false,
+        );
       if (restoreBounds != null) {
-        await windowManager.setBounds(restoreBounds);
+        window.bounds = restoreBounds.toNative();
+      } else {
+        window.center();
       }
-      if (savedMaximized) {
-        await windowManager.maximize();
-      }
-      await windowManager.show();
-      await windowManager.focus();
+      if (savedMaximized) window.maximize();
+      window
+        ..show()
+        ..focus();
       WindowPlacement.track();
-    });
+      mainWindow = window;
+    }
   }
 
   // Defer optional desktop integrations until Flutter has rendered its first frame.
   await WidgetsBinding.instance.endOfFrame;
 
-  if (windowReady != null) {
-    await windowReady;
-    await SystemTrayManager.instance.initialize();
+  if (mainWindow != null) {
+    await SystemTrayManager.instance.initialize(mainWindow);
     await GlobalHotkeyService.initialize();
   }
 }
@@ -110,7 +140,10 @@ class MyApp extends StatelessWidget {
           builder: (context, child) {
             return RepaintBoundary(
               child: GlobalNotificationListener(
-                child: child ?? const SizedBox.shrink(),
+                child: Actions(
+                  actions: unfocusOnTapOutside,
+                  child: child ?? const SizedBox.shrink(),
+                ),
               ),
             );
           },

@@ -105,12 +105,25 @@ pub struct StreamManager {
 
 impl StreamManager {
     pub fn new(api: Arc<ApiService>, url_cache: UrlCache, track_cache: Arc<TrackCache>) -> Self {
-        let http_client = crate::util::tls::builder()
+        let http_client = match crate::util::tls::builder()
             .pool_max_idle_per_host(4)
             .pool_idle_timeout(std::time::Duration::from_secs(60))
-            .timeout(std::time::Duration::from_secs(10))
+            // Range fetches carry up to a few MB; a total deadline kills them
+            // on any link slower than ~3 Mbit/s and starves playback. The
+            // data source already enforces its own per-range deadlines; here
+            // only a dead peer needs detection, which read_timeout provides.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        {
+            Ok(client) => client,
+            Err(e) => {
+                // The custom builder carries the platform verifier; falling back
+                // silently would surface later as unexplainable TLS failures.
+                tracing::error!(error = %e, "http_client_build_failed_using_default");
+                reqwest::Client::new()
+            }
+        };
 
         Self {
             api,
@@ -155,8 +168,16 @@ impl StreamManager {
         self.prewarm_cache.lock().has_ready(track_id)
     }
 
+    /// Adopts an already-built prewarm session without ever building a new
+    /// one — the gapless preheat path must never block the audio actor on a
+    /// cold network session. Returns `None` when the session is still being
+    /// built (the preheat trigger retries on its next tick).
+    pub fn adopt_prewarmed(&self, track_id: &str) -> Option<PreparedStream> {
+        self.prewarm_cache.lock().remove(track_id)
+    }
+
     pub async fn is_track_offline(&self, track_id: &str) -> bool {
-        self.track_cache.get_track_file(track_id).await.is_some()
+        self.track_cache.get_track_file(track_id).is_some()
     }
 
     pub async fn create_stream_session(&self, track: &Track) -> Result<PreparedStream> {
@@ -172,7 +193,7 @@ impl StreamManager {
         let progress_clone = progress.clone();
 
         // 1. Check if track is fully downloaded in offline cache
-        if let Some((path, codec)) = self.track_cache.get_track_file(&track.id).await {
+        if let Some((path, codec)) = self.track_cache.get_track_file(&track.id) {
             let codec_clone = codec.clone();
 
             // Blocking FS stays off the async executor.
@@ -243,12 +264,12 @@ impl StreamManager {
         )
         .await
         .map_err(|e| {
-            let msg = e.to_string();
-            // Expired/rejected stream URL: drop it so the next attempt refetches.
-            if msg.contains("403") || msg.contains("rejected") {
+            // Only a server-side rejection means the cached URL is dead;
+            // a transport failure must keep it for the next attempt.
+            if matches!(e, stream::StreamSourceError::Rejected(_)) {
                 url_cache.remove(&track_id);
             }
-            Box::<dyn std::error::Error + Send + Sync>::from(msg)
+            Box::<dyn std::error::Error + Send + Sync>::from(e)
         })?;
         let codec_clone = codec.clone();
 
@@ -302,6 +323,8 @@ mod tests {
         cache.start("track-7").expect("first attempt starts");
         cache.invalidate("track-7");
         assert!(!cache.has_ready("track-7"));
-        cache.start("track-7").expect("attempt restarts after invalidate");
+        cache
+            .start("track-7")
+            .expect("attempt restarts after invalidate");
     }
 }

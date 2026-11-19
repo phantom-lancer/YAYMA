@@ -1,3 +1,4 @@
+use crate::audio::enums::RepeatMode;
 use crate::audio::queue::PlaybackContext;
 use im::Vector;
 use std::time::Duration;
@@ -19,7 +20,10 @@ pub enum AudioMessage {
     /// Unconditional previous-track skip: unlike `Prev`, it does not restart
     /// the current track when the playhead is past the restart threshold.
     PreviousTrack,
-    Seek(Duration),
+    /// Track id captured at send time; the actor drops the seek when the
+    /// loaded track changed in flight (auto-advance / Next). `None` keeps
+    /// the legacy unguarded behavior.
+    Seek(Duration, Option<String>),
     SetVolume(u8),
     /// Applies a transient gain on top of the user volume without changing
     /// the volume signal or its persisted setting (e.g. Android ducking).
@@ -39,6 +43,14 @@ pub enum AudioMessage {
     PlayTrackNext(Track),
     RemoveFromQueue(usize),
     ClearQueue,
+    /// Moves the queue entry at `from` to `to`, keeping the current track
+    /// playing when it is the one being moved.
+    ReorderQueue(usize, usize),
+    /// Jumps to the queue entry at `index` and plays it; under shuffle the
+    /// order is re-rolled anchored on the target track.
+    PlayQueueIndex(usize),
+    SetRepeatMode(RepeatMode),
+    SetShuffle(bool),
     ToggleShuffle,
     ToggleRepeatMode,
 
@@ -61,5 +73,20 @@ pub enum AudioMessage {
     // Internal/Other
     ReloadCurrentTrack,
     TrackEnded,
+    /// Monitor request (throttled): with the current track nearing its end,
+    /// park the prewarmed next session on the second engine player so the
+    /// boundary swap is seamless.
+    PreheatNext,
+    /// Fired by the boundary watch thread within milliseconds of the current
+    /// source's last sample. Handlers filter stale firings (player stopped by
+    /// skip/seek) via the preheat state and the engine emptiness.
+    BoundaryCrossed,
+    /// Monitor request: the configured crossfade window has been reached with
+    /// a preheated next session parked — start the overlap transition.
+    BeginCrossfade,
     RecreateStream,
+    /// Stops the audio actor so its post-loop teardown runs. The actor owns
+    /// one of the channel's senders itself, so `recv()` can never return
+    /// `None` — this message is the only way the loop ends.
+    Shutdown,
 }

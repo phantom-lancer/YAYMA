@@ -145,7 +145,6 @@ class _ArtistViewState extends State<ArtistView> {
         _tracks.value = [..._tracks.value, ...details.tracks];
       }
     } on Object catch (e) {
-      debugPrint('Error loading more tracks: $e');
       showAppError(humanizeError(e));
     } finally {
       _isLoading.value = false;
@@ -199,7 +198,10 @@ class _ArtistViewState extends State<ArtistView> {
         // No subscriptions while the screen is hidden (local signals keep
         // loading in the background, the UI just doesn't rebuild for it).
         if (visibleSignal(context, _isError) != null) {
-          return CommonErrorWidget(error: visibleSignal(context, _isError)!);
+          return CommonErrorWidget(
+            error: visibleSignal(context, _isError)!,
+            onRetry: requestGlobalRefresh,
+          );
         }
 
         final artist = visibleSignal(context, _artist);
@@ -239,11 +241,11 @@ class _ArtistViewState extends State<ArtistView> {
                 IconButton(
                   onPressed: () =>
                       unawaited(_toggleArtistLike(artist, isLiked)),
-                  tooltip: isLiked ? 'В любимых' : 'В любимые',
                   icon: Icon(
                     isLiked
                         ? Icons.favorite_rounded
                         : Icons.favorite_border_rounded,
+                    semanticLabel: isLiked ? 'В любимых' : 'В любимые',
                   ),
                   style: IconButton.styleFrom(
                     minimumSize: const Size(64, 56),

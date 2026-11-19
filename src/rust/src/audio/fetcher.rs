@@ -73,6 +73,12 @@ pub enum FetchError {
     PendingIdsNotEmpty,
 }
 
+// Big variants travel one at a time across a channel and are consumed
+// immediately, so boxing them would only add an allocation.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "results cross a channel one at a time; boxing adds per-request allocation"
+)]
 pub enum FetchTaskResult {
     Playlist {
         ids: Vec<String>,
@@ -246,6 +252,10 @@ impl FetchState {
             );
         }
         preserve_session_identity(&mut session, guard.as_ref());
+        // The replaced session is dead: its per-track batch ids must not
+        // survive, or feedback built after a recreate carries a foreign
+        // batchId that 400s the new session's page/feedback requests.
+        self.wave_batch_ids.lock().clear();
         self.remember_wave_batch_locked(&session.batch_id, &session.sequence);
         *guard = Some(session);
     }
@@ -291,6 +301,19 @@ impl FetchState {
 
     pub fn wave_session_clone(&self) -> Option<Session> {
         self.wave_session.lock().clone()
+    }
+
+    /// Runs `f` with the stored wave session under the lock. Callers that only
+    /// read a few fields must not clone it: it carries a whole page of tracks.
+    pub fn with_wave_session<R>(&self, f: impl FnOnce(&Session) -> R) -> Option<R> {
+        self.wave_session.lock().as_ref().map(f)
+    }
+
+    pub fn wave_session_terminated(&self) -> bool {
+        self.wave_session
+            .lock()
+            .as_ref()
+            .is_some_and(|s| s.terminated)
     }
 
     pub fn wave_session_arc(&self) -> Arc<Mutex<Option<Session>>> {
@@ -353,19 +376,24 @@ impl FetchState {
         if self.is_fetching() {
             return Err(FetchError::AlreadyFetching);
         }
-        let session = match self.wave_session_clone() {
-            Some(s) => s,
-            None => return Err(FetchError::MissingWaveSession),
-        };
-        let session_id = match session.radio_session_id.clone() {
-            Some(id) if !id.is_empty() => id,
-            _ => return Err(FetchError::MissingWaveSession),
+        // Snapshot only what the spawned task needs: the session carries a
+        // whole page of tracks.
+        let Some((session_id, default_batch, source_id)) = self
+            .with_wave_session(|s| {
+                Some((
+                    s.radio_session_id.clone().filter(|id| !id.is_empty())?,
+                    s.batch_id.clone(),
+                    s.source_id().to_string(),
+                ))
+            })
+            .flatten()
+        else {
+            return Err(FetchError::MissingWaveSession);
         };
 
         let finished = self.fetch_finished.clone();
         let result_tx = self.result_tx.clone();
         self.task = Some(tokio::spawn(async move {
-            let default_batch = session.batch_id.clone();
             // Kept aside so a failed page request can hand its finish/skip
             // events back for retry instead of dropping them.
             let retry_events = pending_feedback.clone();
@@ -389,7 +417,7 @@ impl FetchState {
                             total_played: Some(e.total_played),
                             track_length: e.track_length,
                         },
-                        from: Some(session.source_id().to_string()),
+                        from: Some(source_id.clone()),
                     }
                 })
                 .collect();
@@ -484,9 +512,13 @@ impl FetchState {
 pub struct WaveExtensionHandles {
     pub queue: Signal<Vector<Track>>,
     pub queue_length: Signal<usize>,
+    pub queue_revision: Signal<u32>,
     pub wave_session: Arc<Mutex<Option<Session>>>,
     pub wave_batch_ids: Arc<Mutex<HashMap<String, String>>>,
     pub playback_context: Arc<Mutex<crate::audio::queue::PlaybackContext>>,
+    /// Mirror of the context projection for the bridge (kept in sync with
+    /// `playback_context` here because this task replaces it off-actor).
+    pub playback_context_dto: Signal<Option<crate::api::models::PlaybackContextDto>>,
     pub generation: u64,
     pub generation_ref: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -524,7 +556,10 @@ impl WaveExtensionHandles {
             &session.batch_id,
             additional.iter().map(|track| track.id.clone()),
         );
-        *self.playback_context.lock() = crate::audio::queue::PlaybackContext::Wave(session);
+        *self.playback_context.lock() = crate::audio::queue::PlaybackContext::Wave(session.clone());
+        self.playback_context_dto.set(Some(
+            crate::audio::queue::PlaybackContext::Wave(session).to_dto(),
+        ));
 
         let visible: Vector<Track> = additional
             .iter()
@@ -535,6 +570,8 @@ impl WaveExtensionHandles {
         self.queue.update(|q| q.extend(visible));
         self.queue_length
             .set(self.queue.with(|q: &Vector<Track>| q.len()));
+        self.queue_revision
+            .update(|revision| *revision = revision.wrapping_add(1));
     }
 }
 
@@ -609,6 +646,25 @@ mod tests {
         assert!(state.wave_session_clone().is_none());
     }
 
+    #[test]
+    fn wave_session_fields_are_read_under_the_lock() {
+        let state = FetchState::new();
+        assert!(!state.wave_session_terminated());
+        assert!(state.with_wave_session(|s| s.batch_id.clone()).is_none());
+
+        state.set_wave_session(test_session("b1", Some("sess-1")));
+        assert!(!state.wave_session_terminated());
+        assert_eq!(
+            state.with_wave_session(|s| s.batch_id.clone()).as_deref(),
+            Some("b1")
+        );
+
+        let mut dead = test_session("b2", Some("sess-1"));
+        dead.terminated = true;
+        state.set_wave_session(dead);
+        assert!(state.wave_session_terminated());
+    }
+
     fn test_session(batch_id: &str, radio_session_id: Option<&str>) -> Session {
         serde_json::from_value(serde_json::json!({
             "batchId": batch_id,
@@ -668,5 +724,21 @@ mod tests {
         let mut state = state;
         state.reset();
         assert!(state.wave_batch_for("t1").is_none());
+    }
+
+    #[test]
+    fn set_wave_session_replaces_stale_batch_attribution() {
+        use crate::util::track::test_track;
+
+        let state = FetchState::new();
+        state.set_wave_session(test_session("b1", Some("sess-1")));
+        state.remember_wave_batch("b1-page", &[test_track("t1")]);
+        assert_eq!(state.wave_batch_for("t1").as_deref(), Some("b1-page"));
+
+        // A recreated session must not inherit the dead session's batches:
+        // stale tracks fall back to the LIVE session's batch instead of
+        // poisoning feedback/page requests with a foreign batchId.
+        state.set_wave_session(test_session("b2", Some("sess-2")));
+        assert_eq!(state.wave_batch_for("t1").as_deref(), Some("b2"));
     }
 }

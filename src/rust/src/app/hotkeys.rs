@@ -24,8 +24,8 @@ use {
     crate::api::library,
     crate::audio::commands::AudioMessage,
     std::str::FromStr,
-    std::sync::mpsc,
     std::sync::OnceLock,
+    std::sync::mpsc,
     std::time::Duration,
     wayclip_global_hotkey::hotkey::{Code, HotKey, Modifiers},
     wayclip_global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager},
@@ -131,12 +131,19 @@ fn merge_with_defaults(mut persisted: HotkeySettings) -> HotkeySettings {
             persisted.bindings.push(def.clone());
         }
     }
-    let order: Vec<&str> = defaults.bindings.iter().map(|b| b.action.as_str()).collect();
+    let order: Vec<&str> = defaults
+        .bindings
+        .iter()
+        .map(|b| b.action.as_str())
+        .collect();
     persisted
         .bindings
         .retain(|b| HotkeyAction::from_name(&b.action).is_some());
     persisted.bindings.sort_by_key(|b| {
-        order.iter().position(|a| *a == b.action).unwrap_or(usize::MAX)
+        order
+            .iter()
+            .position(|a| *a == b.action)
+            .unwrap_or(usize::MAX)
     });
     persisted
 }
@@ -183,27 +190,36 @@ pub async fn init(ctx: AppContext, mut shutdown_rx: tokio::sync::watch::Receiver
     let settings = load_settings(&ctx).await;
     *SETTINGS.write() = merge_with_defaults(settings);
 
-    let (tx, rx) = mpsc::channel::<ManagerCmd>();
-    let _ = MANAGER_TX.set(tx);
+    // The manager and event threads are process singletons: their channels
+    // (`MANAGER_TX`, the crate-global event receiver) are set once, so a
+    // later session stays connected only while the first thread lives.
+    if MANAGER_TX.get().is_none() {
+        let (tx, rx) = mpsc::channel::<ManagerCmd>();
+        let _ = MANAGER_TX.set(tx);
 
-    std::thread::Builder::new()
-        .name("hotkey-manager".into())
-        .spawn(move || manager_loop(rx))
-        .expect("spawn hotkey manager thread");
+        std::thread::Builder::new()
+            .name("hotkey-manager".into())
+            .spawn(move || manager_loop(rx))
+            .expect("spawn hotkey manager thread");
 
-    std::thread::Builder::new()
-        .name("hotkey-events".into())
-        .spawn(event_loop)
-        .expect("spawn hotkey event thread");
+        std::thread::Builder::new()
+            .name("hotkey-events".into())
+            .spawn(event_loop)
+            .expect("spawn hotkey event thread");
+    }
 
     apply_current();
 
     tokio::spawn(async move {
         let _ = shutdown_rx.changed().await;
         if *shutdown_rx.borrow() {
-            if let Some(tx) = MANAGER_TX.get() {
-                let _ = tx.send(ManagerCmd::Shutdown);
-            }
+            // Logout: unregister everything and drop the context clone so
+            // presses between accounts dispatch to nothing. The manager
+            // thread itself must survive — killing it would strand
+            // `MANAGER_TX` and break the next login's re-registration; the
+            // next `init` re-applies the persisted bindings.
+            send_apply(Vec::new());
+            *CTX.write() = None;
         }
     });
 }
@@ -221,7 +237,7 @@ async fn load_settings(ctx: &AppContext) -> HotkeySettings {
 async fn persist_settings(ctx: &AppContext, settings: &HotkeySettings) {
     let mut db = ctx.core.db.lock().await;
     if let Err(e) = db.save_setting(SETTINGS_KEY, settings).await {
-        tracing::error!("Failed to persist hotkey settings: {:?}", e);
+        tracing::error!(error = ?e, "persist_hotkey_settings_failed");
     }
 }
 
@@ -327,7 +343,7 @@ fn apply_current() {
             Some((hotkey.id(), action))
         })
         .collect();
-    *REGISTERED.write() = registered.clone();
+    *REGISTERED.write() = registered;
 
     if !settings.enabled {
         // Still send an empty apply so previously registered hotkeys are
@@ -379,7 +395,7 @@ fn manager_loop(rx: mpsc::Receiver<ManagerCmd>) {
     let manager = match GlobalHotKeyManager::new() {
         Ok(manager) => manager,
         Err(e) => {
-            tracing::error!("Failed to create global hotkey manager: {e}");
+            tracing::error!(error = %e, "create_global_hotkey_manager_failed");
             return;
         }
     };
@@ -396,7 +412,7 @@ fn manager_loop(rx: mpsc::Receiver<ManagerCmd>) {
             Ok(ManagerCmd::Apply(hotkeys)) => {
                 for old in &registered {
                     if let Err(e) = manager.unregister(*old) {
-                        tracing::debug!("Hotkey unregister failed: {e}");
+                        tracing::debug!(error = %e, "hotkey_unregister_failed");
                     }
                 }
                 registered.clear();
@@ -404,7 +420,7 @@ fn manager_loop(rx: mpsc::Receiver<ManagerCmd>) {
                     match manager.register(hotkey) {
                         Ok(()) => registered.push(hotkey),
                         // The combo may already belong to another application.
-                        Err(e) => tracing::warn!("Hotkey register failed: {e}"),
+                        Err(e) => tracing::warn!(error = %e, "hotkey_register_failed"),
                     }
                 }
             }
@@ -420,6 +436,8 @@ fn pump_win32_messages() {
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
     };
+    // SAFETY: this is the thread that created the windows whose messages are
+    // pumped; `msg` is a stack value owned by the loop for the whole call.
     unsafe {
         let mut msg = MSG::default();
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -491,9 +509,10 @@ async fn seek_by(ctx: &AppContext, offset_ms: i64) {
     let position = ctx.audio.signals.position_ms.get() as i64;
     let duration = ctx.audio.signals.duration_ms.get() as i64;
     let target = (position + offset_ms).clamp(0, duration.max(0)) as u64;
+    let track_id = ctx.audio.signals.current_track_id.get();
     let _ = ctx
         .audio
         .tx
-        .send(AudioMessage::Seek(Duration::from_millis(target)))
+        .send(AudioMessage::Seek(Duration::from_millis(target), track_id))
         .await;
 }

@@ -17,6 +17,9 @@ class WindowPlacement {
 
   static const String _fileName = 'window_geometry.json';
   static const Size defaultSize = Size(1280, 720);
+
+  /// The desktop shell never shows the touch layout, so this stays above
+  /// `compactBreakpoint`. Enforced by test/window_min_size_test.dart.
   static const Size minimumSize = Size(800, 600);
 
   /// How much of the window must land on a visible display area to keep
@@ -26,46 +29,36 @@ class WindowPlacement {
 
   static final _Tracker _tracker = _Tracker();
 
-  /// Saved geometry validated against connected displays, or null when
-  /// nothing usable was stored.
-  static Future<Rect?> loadBounds() async {
+  /// Saved geometry in one file read: bounds validated against the minimum
+  /// window size, plus the maximized flag.
+  static Future<({Rect? bounds, bool maximized})> loadState() async {
     final data = await _read();
+    return (bounds: parseBounds(data), maximized: data?['maximized'] == true);
+  }
+
+  /// Parses and validates the saved-geometry map; pure and public so the
+  /// file trust boundary stays testable without touching the disk. No upper
+  /// size cap: a window spanning two 4K monitors is wider than 7680 logical
+  /// px, and absurd sizes are clamped by the OS on restore anyway.
+  static Rect? parseBounds(Map<String, dynamic>? data) {
     if (data == null) return null;
     final width = _toDouble(data['width']);
     final height = _toDouble(data['height']);
+    if (width == null || height == null) return null;
+    if (width < minimumSize.width || height < minimumSize.height) return null;
     final x = _toDouble(data['x']);
     final y = _toDouble(data['y']);
-    if (width == null || height == null) return null;
-    if (width < minimumSize.width ||
-        height < minimumSize.height ||
-        width > 7680 ||
-        height > 4320) {
-      return null;
-    }
-    if (x == null || y == null || !x.isFinite || !y.isFinite) return null;
+    if (x == null || y == null) return null;
     return Rect.fromLTWH(x, y, width, height);
-  }
-
-  static Future<bool> loadMaximized() async {
-    final data = await _read();
-    return data?['maximized'] == true;
-  }
-
-  /// Saved size regardless of position validity. Used on Wayland and as a
-  /// fallback when the saved monitor is gone.
-  static Future<Size?> loadSize() async {
-    final bounds = await loadBounds();
-    return bounds?.size;
   }
 
   /// Whether the saved position is actually visible on a connected display.
   static Future<bool> isPositionVisible(Rect bounds) async {
     try {
-      final displays = await screenRetriever.getAllDisplays();
-      for (final display in displays) {
-        final area = _visibleArea(display);
-        if (area == null) continue;
-        final intersection = area.intersect(bounds);
+      for (final display in DisplayManager.instance.getAll()) {
+        // The work area is the display minus panels and docks: the part of
+        // the screen a window can actually be seen in.
+        final intersection = display.workArea.toRect().intersect(bounds);
         if (intersection.width >= _minVisibleWidth &&
             intersection.height >= _minVisibleHeight) {
           return true;
@@ -91,16 +84,6 @@ class WindowPlacement {
 
   /// Persist the current geometry immediately (e.g. before hide/quit).
   static Future<void> saveNow() => _tracker.saveNow();
-
-  static Rect? _visibleArea(Display display) {
-    final position = display.visiblePosition;
-    final size = display.visibleSize ?? display.size;
-    if (position == null) {
-      // No origin reported: assume a single primary display at (0, 0).
-      return Rect.fromLTWH(0, 0, size.width, size.height);
-    }
-    return Rect.fromLTWH(position.dx, position.dy, size.width, size.height);
-  }
 
   static Future<Map<String, dynamic>?> _read() async {
     try {
@@ -176,23 +159,27 @@ class WindowPlacement {
   }
 }
 
-class _Tracker with WindowListener {
+class _Tracker {
   bool _attached = false;
   Timer? _debounce;
   Rect? _lastNormalBounds;
 
+  Window? get _window => WindowManager.instance.getCurrent();
+
   void attach() {
     if (_attached) return;
+    final window = _window;
+    if (window == null) return;
     _attached = true;
-    windowManager.addListener(this);
+    window.addListener(_onWindowEvent);
     // Capture the initial (restored or default) bounds as the normal state.
-    unawaited(_captureInitial());
+    unawaited(_captureInitial(window));
   }
 
-  Future<void> _captureInitial() async {
+  Future<void> _captureInitial(Window window) async {
     try {
-      if (!await windowManager.isMaximized()) {
-        _lastNormalBounds = await windowManager.getBounds();
+      if (!window.isMaximized) {
+        _lastNormalBounds = window.bounds.toRect();
       }
     } on Object {
       // Ignore; first move/resize will populate it.
@@ -210,16 +197,19 @@ class _Tracker with WindowListener {
     // Drop any pending debounced save: this is the save.
     _debounce?.cancel();
     _debounce = null;
+    final window = _window;
+    if (window == null) return;
     try {
-      if (await windowManager.isMinimized() ||
-          await windowManager.isFullScreen()) {
+      if (window.isMinimized || window.isFullScreen) {
         // Transient states must not overwrite the good geometry.
         return;
       }
-      final maximized = await windowManager.isMaximized();
-      if (maximized) {
-        // getBounds() while maximized returns the fullscreen rect, so keep
-        // the last normal bounds and only flip the maximized flag.
+      if (window.isMaximized) {
+        // Bounds while maximized return the maximized rect, so keep the last
+        // normal bounds and only flip the maximized flag.
+        // shortcut: bounds moved less than 500ms before maximize keep the
+        // older position; switch to the OS-tracked restore position once
+        // nativeapi exposes one (per-event capture would regress snapping).
         final normal = _lastNormalBounds;
         if (normal != null) {
           await WindowPlacement.persistBounds(normal, maximized: true);
@@ -232,7 +222,7 @@ class _Tracker with WindowListener {
         }
         return;
       }
-      final bounds = await windowManager.getBounds();
+      final bounds = window.bounds.toRect();
       if (bounds.width < WindowPlacement.minimumSize.width ||
           bounds.height < WindowPlacement.minimumSize.height) {
         return;
@@ -244,18 +234,17 @@ class _Tracker with WindowListener {
     }
   }
 
-  @override
-  void onWindowMoved() => _scheduleSave();
-
-  @override
-  void onWindowResized() => _scheduleSave();
-
-  @override
-  void onWindowMaximize() => unawaited(saveNow());
-
-  @override
-  void onWindowUnmaximize() => unawaited(saveNow());
-
-  @override
-  void onWindowClose() => unawaited(saveNow());
+  void _onWindowEvent(WindowEvent event) {
+    switch (event) {
+      case WindowMovedEvent():
+      case WindowResizedEvent():
+        _scheduleSave();
+      case WindowMaximizedEvent():
+      case WindowRestoredEvent():
+      case WindowCloseRequestedEvent():
+        unawaited(saveNow());
+      default:
+        break;
+    }
+  }
 }

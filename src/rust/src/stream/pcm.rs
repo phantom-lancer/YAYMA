@@ -54,8 +54,8 @@ pub struct BufferedStreamingSource {
     sample_pos: usize,
     pending_generation: u64,
     generation: Arc<AtomicU64>,
-    sample_rate: u32,
-    channels: u16,
+    sample_rate: NonZero<u32>,
+    channels: NonZero<u16>,
     total_duration: Option<Duration>,
     finished_generation: Option<u64>,
     controller: StreamController,
@@ -124,9 +124,14 @@ impl BufferedStreamingSource {
                     continue;
                 }
                 Err(TryRecvError::Empty) => {
-                    // Wait with a timeout so seek/stop (generation bump) wakes
-                    // us even when the decoder is stalled; the loop head
-                    // re-checks the generation on every wake-up.
+                    // shortcut: the RT thread can block here (by design, no
+                    // manufactured silence) for as long as the decoder stalls
+                    // on the network; the real exits (channel message /
+                    // disconnect) wake recv_timeout immediately, and a
+                    // generation bump is only ever written by this same
+                    // thread (try_seek), so the wait length never gates
+                    // unwedging. Proper fix: an SPSC ring fed by a dedicated
+                    // thread, needed only if network stalls become frequent.
                     match self.rx.recv_timeout(Duration::from_millis(150)) {
                         Ok(SampleMessage::Samples(samples, msg_gen)) => {
                             if msg_gen != current_generation {
@@ -158,8 +163,8 @@ impl BufferedStreamingSource {
         rx: CbReceiver<SampleMessage>,
         recycle_tx: CbSender<Vec<f32>>,
         generation: Arc<AtomicU64>,
-        sample_rate: u32,
-        channels: u16,
+        sample_rate: NonZero<u32>,
+        channels: NonZero<u16>,
         total_duration: Option<Duration>,
         controller: StreamController,
     ) -> Self {
@@ -218,11 +223,11 @@ impl Source for BufferedStreamingSource {
     }
 
     fn channels(&self) -> NonZero<u16> {
-        NonZero::new(self.channels).unwrap()
+        self.channels
     }
 
     fn sample_rate(&self) -> NonZero<u32> {
-        NonZero::new(self.sample_rate).unwrap()
+        self.sample_rate
     }
 
     fn total_duration(&self) -> Option<Duration> {
@@ -230,6 +235,10 @@ impl Source for BufferedStreamingSource {
     }
 
     fn try_seek(&mut self, pos: Duration) -> std::result::Result<(), rodio::source::SeekError> {
+        // shortcut: the seek is acknowledged optimistically. The decoder's
+        // coarse seek runs on its own thread and may fail (only a warning is
+        // logged), while the UI already shows `pos`; reporting it back would
+        // need a seek-result channel from the decode loop.
         self.recycle_current();
         self.sample_pos = 0;
         self.finished_generation = None;
@@ -297,8 +306,8 @@ pub fn create_streaming_session<R: std::io::Read + std::io::Seek + Send + Sync +
         sample_rx,
         recycle_tx,
         generation,
-        sample_rate.get(),
-        channels.get(),
+        sample_rate,
+        channels,
         total_duration,
         controller.clone(),
     );
@@ -310,8 +319,49 @@ pub fn create_streaming_session<R: std::io::Read + std::io::Seek + Send + Sync +
     })
 }
 
+/// Decoder-side state of a stream: the decoder itself plus the buffers moving
+/// between the decode thread and the audio thread.
+struct DecodeState<R: std::io::Read + std::io::Seek> {
+    decoder: Decoder<R>,
+    progress: Arc<TrackProgress>,
+    progress_generation: u64,
+    active_generation: u64,
+    chunk: Vec<f32>,
+    pending_chunk: Option<Vec<f32>>,
+}
+
+impl<R: std::io::Read + std::io::Seek> DecodeState<R> {
+    /// Applies one seek command: repositions the decoder, recycles the data of
+    /// the generation being abandoned and adopts the seeker's generation, so
+    /// samples decoded before the seek are dropped downstream.
+    fn apply_seek(&mut self, position: Duration, generation: u64) {
+        if let Err(e) = self.decoder.try_seek(position) {
+            tracing::warn!(error = %e, "decoder coarse seek failed");
+        }
+        if self.progress_generation == self.progress.get_generation() {
+            self.progress.set_current_position(position);
+        }
+        self.active_generation = generation;
+        if let Some(mut reused) = self.pending_chunk.take() {
+            reused.clear();
+            self.chunk = reused;
+        }
+    }
+}
+
+/// Reuses a buffer the audio thread handed back, or allocates one.
+fn take_buffer(recycle_rx: &CbReceiver<Vec<f32>>) -> Vec<f32> {
+    match recycle_rx.try_recv() {
+        Ok(mut v) => {
+            v.clear();
+            v
+        }
+        Err(_) => Vec::with_capacity(PCM_CHUNK_SAMPLES),
+    }
+}
+
 fn run_decode_loop<R: std::io::Read + std::io::Seek + Send + Sync + 'static>(
-    mut decoder: Decoder<R>,
+    decoder: Decoder<R>,
     sample_tx: CbSender<SampleMessage>,
     cmd_rx: CbReceiver<DecoderCommand>,
     recycle_rx: CbReceiver<Vec<f32>>,
@@ -319,65 +369,42 @@ fn run_decode_loop<R: std::io::Read + std::io::Seek + Send + Sync + 'static>(
     progress: Arc<TrackProgress>,
     progress_generation: u64,
 ) {
-    let mut active_generation = generation.load(Ordering::Acquire);
-
-    let get_buffer = || match recycle_rx.try_recv() {
-        Ok(mut v) => {
-            v.clear();
-            v
-        }
-        Err(_) => Vec::with_capacity(PCM_CHUNK_SAMPLES),
+    let active_generation = generation.load(Ordering::Acquire);
+    let mut state = DecodeState {
+        decoder,
+        progress,
+        progress_generation,
+        active_generation,
+        chunk: take_buffer(&recycle_rx),
+        pending_chunk: None,
     };
 
-    let mut chunk = get_buffer();
-    let mut pending_chunk: Option<Vec<f32>> = None;
-
     loop {
+        // Drain pending commands before any decoding work, so a seek or stop
+        // that landed while the sender was blocked is applied first.
         loop {
             match cmd_rx.try_recv() {
                 Ok(DecoderCommand::Seek {
                     position,
-                    generation: new_gen,
-                }) => {
-                    if let Err(e) = decoder.try_seek(position) {
-                        tracing::warn!(error = %e, "decoder coarse seek failed");
-                    }
-                    if progress_generation == progress.get_generation() {
-                        progress.set_current_position(position);
-                    }
-                    active_generation = new_gen;
-                    if let Some(mut pc) = pending_chunk.take() {
-                        pc.clear();
-                        chunk = pc;
-                    }
-                }
+                    generation,
+                }) => state.apply_seek(position, generation),
                 Ok(DecoderCommand::Stop) => return,
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => return,
             }
         }
 
-        if let Some(chunk_to_send) = pending_chunk.take() {
+        if let Some(chunk_to_send) = state.pending_chunk.take() {
             select! {
-                send(sample_tx, SampleMessage::Samples(chunk_to_send, active_generation)) -> res => {
+                send(sample_tx, SampleMessage::Samples(chunk_to_send, state.active_generation)) -> res => {
                     if res.is_err() {
                         return;
                     }
                 }
                 recv(cmd_rx) -> msg => {
                     match msg {
-                        Ok(DecoderCommand::Seek { position, generation: new_gen }) => {
-                            if let Err(e) = decoder.try_seek(position) {
-                                tracing::warn!(error = %e, "decoder coarse seek failed");
-                            }
-                            if progress_generation == progress.get_generation() {
-                                progress.set_current_position(position);
-                            }
-                            active_generation = new_gen;
-                            if let Some(mut pc) = pending_chunk.take() {
-                                pc.clear();
-                                chunk = pc;
-                            }
+                        Ok(DecoderCommand::Seek { position, generation }) => {
+                            state.apply_seek(position, generation);
                             continue;
                         }
                         Ok(DecoderCommand::Stop) => return,
@@ -387,17 +414,17 @@ fn run_decode_loop<R: std::io::Read + std::io::Seek + Send + Sync + 'static>(
             }
         }
 
-        chunk.clear();
+        state.chunk.clear();
         for _ in 0..PCM_CHUNK_SAMPLES {
-            match decoder.next() {
-                Some(sample) => chunk.push(sample),
+            match state.decoder.next() {
+                Some(sample) => state.chunk.push(sample),
                 None => break,
             }
         }
 
-        if chunk.is_empty() {
+        if state.chunk.is_empty() {
             if sample_tx
-                .send(SampleMessage::Finished(active_generation))
+                .send(SampleMessage::Finished(state.active_generation))
                 .is_err()
             {
                 return;
@@ -407,33 +434,23 @@ fn run_decode_loop<R: std::io::Read + std::io::Seek + Send + Sync + 'static>(
             match cmd_rx.recv() {
                 Ok(DecoderCommand::Seek {
                     position,
-                    generation: new_gen,
+                    generation,
                 }) => {
-                    if let Err(e) = decoder.try_seek(position) {
-                        tracing::warn!(error = %e, "decoder coarse seek failed");
-                    }
-                    if progress_generation == progress.get_generation() {
-                        progress.set_current_position(position);
-                    }
-                    active_generation = new_gen;
-                    if let Some(mut pc) = pending_chunk.take() {
-                        pc.clear();
-                        chunk = pc;
-                    }
+                    state.apply_seek(position, generation);
                     continue;
                 }
                 Ok(DecoderCommand::Stop) | Err(_) => return,
             }
         }
 
-        let new_chunk = get_buffer();
-        let send_chunk = std::mem::replace(&mut chunk, new_chunk);
+        let new_chunk = take_buffer(&recycle_rx);
+        let send_chunk = std::mem::replace(&mut state.chunk, new_chunk);
 
-        match sample_tx.try_send(SampleMessage::Samples(send_chunk, active_generation)) {
+        match sample_tx.try_send(SampleMessage::Samples(send_chunk, state.active_generation)) {
             Ok(()) => {}
             Err(crossbeam_channel::TrySendError::Full(msg)) => {
                 if let SampleMessage::Samples(chunk_data, _) = msg {
-                    pending_chunk = Some(chunk_data);
+                    state.pending_chunk = Some(chunk_data);
                 }
             }
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
@@ -447,7 +464,101 @@ fn run_decode_loop<R: std::io::Read + std::io::Seek + Send + Sync + 'static>(
 mod tests {
     use super::*;
     use crate::audio::fx::BlockSource;
+    use std::io::Cursor;
     use std::sync::Arc;
+
+    /// Mono 16-bit WAV: silence for the first `step_seconds`, then a constant
+    /// half-scale tone. A decoder position is then visible in the samples.
+    fn wav_with_step(step_seconds: u32, total_seconds: u32) -> Vec<u8> {
+        const SAMPLE_RATE: u32 = 44100;
+        let total = SAMPLE_RATE * total_seconds;
+        let step = SAMPLE_RATE * step_seconds;
+
+        let mut data = Vec::with_capacity(total as usize * 2);
+        for i in 0..total {
+            let value: i16 = if i < step { 0 } else { 16384 };
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let mut wav = Vec::with_capacity(44 + data.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+        wav
+    }
+
+    fn decode_state(
+        pending: Option<Vec<f32>>,
+    ) -> (DecodeState<Cursor<Vec<u8>>>, Arc<TrackProgress>) {
+        let decoder = Decoder::new(Cursor::new(wav_with_step(1, 2))).expect("decode in-memory wav");
+        let progress = Arc::new(TrackProgress::default());
+        let state = DecodeState {
+            decoder,
+            progress: progress.clone(),
+            progress_generation: 0,
+            active_generation: 0,
+            chunk: Vec::new(),
+            pending_chunk: pending,
+        };
+        (state, progress)
+    }
+
+    #[test]
+    fn apply_seek_repositions_the_decoder() {
+        let (mut state, _progress) = decode_state(None);
+        assert!(
+            state.decoder.next().expect("first sample") < 0.01,
+            "the fixture starts with silence"
+        );
+
+        state.apply_seek(Duration::from_millis(1500), 7);
+
+        let sample = state.decoder.next().expect("sample after seek");
+        assert!(
+            (sample - 0.5).abs() < 0.05,
+            "seek must land past the 1s step, got {sample}"
+        );
+    }
+
+    #[test]
+    fn apply_seek_adopts_generation_and_recycles_the_pending_chunk() {
+        let (mut state, _progress) = decode_state(Some(vec![9.0; 4]));
+
+        state.apply_seek(Duration::from_secs(1), 7);
+
+        assert_eq!(state.active_generation, 7);
+        assert!(state.pending_chunk.is_none());
+        assert!(state.chunk.is_empty(), "recycled buffer is cleared");
+        assert!(
+            state.chunk.capacity() >= 4,
+            "pending buffer is reused, not dropped"
+        );
+    }
+
+    #[test]
+    fn apply_seek_updates_progress_only_for_its_own_session() {
+        let (mut state, progress) = decode_state(None);
+
+        state.apply_seek(Duration::from_millis(1500), 1);
+        assert_eq!(progress.current_position(), Duration::from_millis(1500));
+
+        // The clock now belongs to a newer session; a stale decoder must not
+        // write its position into it.
+        progress.reset();
+        progress.set_current_position(Duration::from_millis(200));
+        state.apply_seek(Duration::from_millis(100), 2);
+        assert_eq!(progress.current_position(), Duration::from_millis(200));
+    }
 
     /// A BufferedStreamingSource wired to test channels — no decoder needed.
     struct TestRig {
@@ -472,8 +583,8 @@ mod tests {
             sample_rx,
             recycle_tx,
             generation.clone(),
-            44100,
-            2,
+            NonZero::new(44100).unwrap(),
+            NonZero::new(2).unwrap(),
             None,
             controller.clone(),
         );
@@ -573,7 +684,10 @@ mod tests {
     fn next_and_read_chunk_share_cursor() {
         let mut rig = make_rig();
         rig.sample_tx
-            .send(SampleMessage::Samples((0..10).map(|i| i as f32).collect(), 0))
+            .send(SampleMessage::Samples(
+                (0..10).map(|i| i as f32).collect(),
+                0,
+            ))
             .unwrap();
 
         assert_eq!(rig.source.next(), Some(0.0));

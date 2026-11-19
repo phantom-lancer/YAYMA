@@ -183,7 +183,10 @@ impl BufferState {
                     while remaining_to_drop > 0 {
                         if let Some(front_chunk) = next_seg.data.front_mut() {
                             if front_chunk.len() <= remaining_to_drop {
-                                let dropped = next_seg.data.pop_front().unwrap();
+                                let dropped = next_seg
+                                    .data
+                                    .pop_front()
+                                    .expect("front chunk exists, checked above");
                                 next_seg.len -= dropped.len();
                                 next_seg.start_pos += dropped.len() as u64;
                                 remaining_to_drop -= dropped.len();
@@ -272,7 +275,10 @@ impl BufferState {
                     while remaining_to_drop > 0 {
                         if let Some(front_chunk) = seg.data.front_mut() {
                             if front_chunk.len() <= remaining_to_drop {
-                                let dropped = seg.data.pop_front().unwrap();
+                                let dropped = seg
+                                    .data
+                                    .pop_front()
+                                    .expect("front chunk exists, checked above");
                                 seg.len -= dropped.len();
                                 seg.start_pos += dropped.len() as u64;
                                 remaining_to_drop -= dropped.len();
@@ -294,7 +300,10 @@ impl BufferState {
                     while remaining_to_drop > 0 {
                         if let Some(back_chunk) = seg.data.back_mut() {
                             if back_chunk.len() <= remaining_to_drop {
-                                let dropped = seg.data.pop_back().unwrap();
+                                let dropped = seg
+                                    .data
+                                    .pop_back()
+                                    .expect("back chunk exists, checked above");
                                 seg.len -= dropped.len();
                                 remaining_to_drop -= dropped.len();
                             } else {
@@ -330,10 +339,7 @@ impl BufferState {
         self.buffering_base = self.buffering_base.max(pos);
 
         // Drop fully consumed segments, keeping at most one for seek-back history.
-        let first_live = self
-            .segments
-            .iter()
-            .position(|s| s.end_pos() > safe_pos);
+        let first_live = self.segments.iter().position(|s| s.end_pos() > safe_pos);
         match first_live {
             Some(idx) if idx > 1 => {
                 self.segments.drain(0..idx - 1);
@@ -354,7 +360,10 @@ impl BufferState {
                 while remaining_to_drop > 0 {
                     if let Some(front_chunk) = seg.data.front_mut() {
                         if front_chunk.len() <= remaining_to_drop {
-                            let dropped = seg.data.pop_front().unwrap();
+                            let dropped = seg
+                                .data
+                                .pop_front()
+                                .expect("front chunk exists, checked above");
                             seg.len -= dropped.len();
                             seg.start_pos += dropped.len() as u64;
                             remaining_to_drop -= dropped.len();

@@ -43,6 +43,21 @@ pub async fn load_persisted_settings(ctx: &AppContext) {
         ctx.core.api.set_quality(quality);
     }
 
+    // Repeat/shuffle ride the normal messages so signal updates, persistence
+    // and (for shuffle) the queue re-roll all go through one code path.
+    if let Some(mode) = parse_setting::<String>(&settings, "repeat_mode") {
+        let mode = match mode.as_str() {
+            "all" => crate::audio::enums::RepeatMode::All,
+            "single" => crate::audio::enums::RepeatMode::Single,
+            _ => crate::audio::enums::RepeatMode::None,
+        };
+        let _ = ctx.audio.tx.send(AudioMessage::SetRepeatMode(mode)).await;
+    }
+
+    if let Some(enabled) = parse_setting::<bool>(&settings, "shuffle_enabled") {
+        let _ = ctx.audio.tx.send(AudioMessage::SetShuffle(enabled)).await;
+    }
+
     if let Some(rpc_enabled) = parse_setting::<bool>(&settings, "discord_rpc") {
         ctx.audio.signals.discord_rpc.set(rpc_enabled);
     }
@@ -50,6 +65,22 @@ pub async fn load_persisted_settings(ctx: &AppContext) {
     let vibe_enabled = parse_setting::<bool>(&settings, "vibe_animation_enabled").unwrap_or(true);
     ctx.audio.signals.vibe_enabled.set(vibe_enabled);
 
+    // Crossfade toggle: a fixed overlap window when on, strict gapless when
+    // off.
+    let crossfade_enabled = parse_setting::<bool>(&settings, "crossfade_enabled").unwrap_or(true);
+    ctx.audio.signals.crossfade_ms.set(if crossfade_enabled {
+        crate::audio::signals::USER_CROSSFADE_MS
+    } else {
+        0
+    });
+
+    let ai_reduction = parse_setting::<bool>(&settings, "ai_content_reduction").unwrap_or(false);
+    ctx.core.api.set_ai_reduction(ai_reduction);
+
+    // Linux always plays through the sound server's default device (routing
+    // belongs to the server), so a stored per-app device name is meaningless
+    // there and must not force an engine recreate on startup.
+    #[cfg(not(target_os = "linux"))]
     if let Some(device) = parse_setting::<String>(&settings, "audio_device")
         && !device.is_empty()
     {

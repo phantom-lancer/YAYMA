@@ -1,17 +1,15 @@
 import 'dart:async';
-import 'dart:math' as math;
-import 'dart:io';
 import 'dart:ui' as ui;
+import 'dart:io';
+import 'dart:math' as math;
 
+import 'package:flutter/services.dart' show PredictiveBackEvent;
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/features/core/services/app_error.dart';
-import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
-import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/theme/app_theme.dart';
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
-import 'package:yayma/src/features/core/views/widgets/app_context_menu.dart';
 import 'package:yayma/src/features/core/views/widgets/app_cover.dart';
 import 'package:yayma/src/features/core/views/widgets/responsive.dart';
 import 'package:yayma/src/features/core/views/widgets/smooth_scroll.dart';
@@ -31,63 +29,168 @@ Future<T?> showAppBottomSheet<T>({
   final cs = Theme.of(context).colorScheme;
   final useLiquidGlass =
       liquidGlassV2EnabledSignal.value && backgroundColor == null;
+  final color = useLiquidGlass
+      ? Colors.transparent
+      : backgroundColor ?? surfaceOverlay(cs.surfaceContainerHighest);
+
   return showM3EModalBottomSheet<T>(
     context: context,
     showDragHandle: showDragHandle,
-    backgroundColor: useLiquidGlass
-        ? Colors.transparent
-        : backgroundColor ?? surfaceOverlay(cs.surfaceContainerHighest),
+    backgroundColor: color,
     style: const M3EBottomSheetStyle(padding: EdgeInsets.zero),
-    builder: (sheetContext) {
-      final content = builder(sheetContext);
-      if (!useLiquidGlass) return content;
+    // The route owns its controller and keeps it alive through the exit
+    // animation. The predictive-back wrapper drives this same route.
+    builder: (context) => M3EBottomSheet(
+      animateEntrance: false,
+      showDragHandle: showDragHandle,
+      backgroundColor: color,
+      style: const M3EBottomSheetStyle(padding: EdgeInsets.zero),
+      child: _PredictiveBackSheet(
+        child: Builder(
+          builder: (sheetContext) {
+            final content = builder(sheetContext);
+            if (!useLiquidGlass) return content;
 
-      final scheme = Theme.of(sheetContext).colorScheme;
-      final profile = androidAppearanceProfileSignal.value;
-      final glassSigma = !Platform.isAndroid
-          ? 20.0
-          : switch (profile) {
-              AndroidAppearanceProfile.yayama => 20.0,
-              AndroidAppearanceProfile.yandexMusic => 24.0,
-              AndroidAppearanceProfile.appleMusic => 30.0,
-              AndroidAppearanceProfile.current => 26.0,
-            };
-      return ClipRRect(
-        borderRadius: const BorderRadius.vertical(
-          top: Radius.circular(AppRadius.xxxl),
-        ),
-        child: BackdropFilter(
-          enabled: blurEffectsEnabledSignal.value,
-          filter: ui.ImageFilter.blur(sigmaX: glassSigma, sigmaY: glassSigma),
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              color: scheme.surfaceContainerHigh.withValues(alpha: 0.76),
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [
-                  scheme.surfaceContainerHigh.withValues(alpha: 0.80),
-                  scheme.surfaceContainer.withValues(alpha: 0.92),
-                ],
+            final scheme = Theme.of(sheetContext).colorScheme;
+            final profile = androidAppearanceProfileSignal.value;
+            final glassSigma = !Platform.isAndroid
+                ? 20.0
+                : switch (profile) {
+                    AndroidAppearanceProfile.yayama => 20.0,
+                    AndroidAppearanceProfile.yandexMusic => 24.0,
+                    AndroidAppearanceProfile.appleMusic => 30.0,
+                    AndroidAppearanceProfile.current => 26.0,
+                  };
+            return ClipRRect(
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(AppRadius.xxxl),
               ),
-              border: Border(
-                top: BorderSide(
-                  color: scheme.onSurface.withValues(alpha: 0.18),
+              child: BackdropFilter(
+                enabled: blurEffectsEnabledSignal.value,
+                filter: ui.ImageFilter.blur(
+                  sigmaX: glassSigma,
+                  sigmaY: glassSigma,
                 ),
-                left: BorderSide(
-                  color: scheme.onSurface.withValues(alpha: 0.08),
-                ),
-                right: BorderSide(
-                  color: scheme.onSurface.withValues(alpha: 0.08),
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: scheme.surfaceContainerHigh.withValues(alpha: 0.76),
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        scheme.surfaceContainerHigh.withValues(alpha: 0.80),
+                        scheme.surfaceContainer.withValues(alpha: 0.92),
+                      ],
+                    ),
+                    border: Border(
+                      top: BorderSide(
+                        color: scheme.onSurface.withValues(alpha: 0.18),
+                      ),
+                      left: BorderSide(
+                        color: scheme.onSurface.withValues(alpha: 0.08),
+                      ),
+                      right: BorderSide(
+                        color: scheme.onSurface.withValues(alpha: 0.08),
+                      ),
+                    ),
+                  ),
+                  child: content,
                 ),
               ),
-            ),
-            child: content,
-          ),
+            );
+          },
         ),
-      );
-    },
+      ),
+    ),
   );
+}
+
+/// Drives the sheet's own route from Android predictive back, the same way
+/// page transitions do for pages.
+class _PredictiveBackSheet extends StatefulWidget {
+  const _PredictiveBackSheet({required this.child});
+
+  final Widget child;
+
+  @override
+  State<_PredictiveBackSheet> createState() => _PredictiveBackSheetState();
+}
+
+class _PredictiveBackSheetState extends State<_PredictiveBackSheet>
+    with WidgetsBindingObserver {
+  TransitionRoute<dynamic>? _route;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    _route = route is TransitionRoute<dynamic> ? route : null;
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  bool handleStartBackGesture(PredictiveBackEvent backEvent) {
+    final route = _route;
+    if (backEvent.isButtonEvent ||
+        route == null ||
+        !route.isCurrent ||
+        !route.popGestureEnabled) {
+      return false;
+    }
+    route.handleStartBackGesture(progress: 1 - backEvent.progress);
+    return true;
+  }
+
+  @override
+  void handleUpdateBackGestureProgress(PredictiveBackEvent backEvent) {
+    _route?.handleUpdateBackGestureProgress(progress: 1 - backEvent.progress);
+  }
+
+  @override
+  void handleCommitBackGesture() {
+    if (!mounted) return;
+    final route = _route;
+    if (route == null) return;
+    final navigator = Navigator.of(context);
+    // Pop now: didPop reverses from where the gesture left it — the same
+    // exit the back button runs. The route's own commit would
+    // reverse(from: upperBound) and snap the sheet back open first.
+    if (route.isCurrent) {
+      navigator.pop();
+    }
+    // Keep the user gesture open until the exit animation finishes, the way
+    // TransitionRoute's own commit bookkeeping does.
+    final animation = route.animation;
+    if (animation != null && animation.status == AnimationStatus.reverse) {
+      late final AnimationStatusListener stopGesture;
+      stopGesture = (status) {
+        if (status == AnimationStatus.dismissed) {
+          navigator.didStopUserGesture();
+          animation.removeStatusListener(stopGesture);
+        }
+      };
+      animation.addStatusListener(stopGesture);
+    } else {
+      navigator.didStopUserGesture();
+    }
+  }
+
+  @override
+  void handleCancelBackGesture() => _route?.handleCancelBackGesture();
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }
 
 String formatDuration(int ms) {
@@ -108,7 +211,9 @@ String formatCount(int value) {
   return buffer.toString();
 }
 
-String _plural(int n, String one, String few, String many) {
+/// Russian plural form for [n]: one / few (2-4) / many, with the 11-14
+/// exception handled.
+String plural(int n, String one, String few, String many) {
   final mod100 = n % 100;
   if (mod100 >= 11 && mod100 <= 14) return many;
   switch (n % 10) {
@@ -126,7 +231,7 @@ String _plural(int n, String one, String few, String many) {
 /// "1 234 567 monthly listeners", or null when there is no data.
 String? formatMonthlyListeners(int? value) {
   if (value == null) return null;
-  return '${formatCount(value)} ${_plural(value, 'слушатель', 'слушателя', 'слушателей')} за месяц';
+  return '${formatCount(value)} ${plural(value, 'слушатель', 'слушателя', 'слушателей')} за месяц';
 }
 
 /// Compact subtitle for artist cards: monthly listeners, falling back to likes.
@@ -134,7 +239,7 @@ String? formatArtistCardSubtitle({int? monthlyListeners, int? likesCount}) {
   final monthly = formatMonthlyListeners(monthlyListeners);
   if (monthly != null) return monthly;
   if (likesCount != null) {
-    return '${formatCount(likesCount)} ${_plural(likesCount, 'слушатель', 'слушателя', 'слушателей')}';
+    return '${formatCount(likesCount)} ${plural(likesCount, 'слушатель', 'слушателя', 'слушателей')}';
   }
   return null;
 }
@@ -156,16 +261,43 @@ class CommonLoadingWidget extends StatelessWidget {
 /// only gets [humanizeError] text, never an internal message.
 class CommonErrorWidget extends StatelessWidget {
   final Object error;
-  const CommonErrorWidget({required this.error, super.key});
+  final VoidCallback? onRetry;
+
+  const CommonErrorWidget({required this.error, this.onRetry, super.key});
+
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),
-        child: Text(
-          humanizeError(error),
-          textAlign: TextAlign.center,
-          style: TextStyle(color: Theme.of(context).colorScheme.error),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.error_outline_rounded, size: 48, color: cs.error),
+            const SizedBox(height: 16),
+            Text(
+              'Не удалось загрузить',
+              style: textTheme.titleMedium?.copyWith(
+                color: cs.onSurface,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              humanizeError(error),
+              textAlign: TextAlign.center,
+              style: textTheme.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
+            ),
+            if (onRetry != null) ...[
+              const SizedBox(height: 24),
+              FilledButton.tonal(
+                onPressed: onRetry,
+                child: const Text('Повторить'),
+              ),
+            ],
+          ],
         ),
       ),
     );
@@ -259,14 +391,13 @@ class CommonDetailHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.sizeOf(context).width;
-    final isNarrow = screenWidth < 600;
+    final isNarrow = context.isNarrow;
     final scheme = Theme.of(context).colorScheme;
     final onSurface = scheme.onSurface;
     final onSurfaceVariant = scheme.onSurfaceVariant;
 
     final actualCoverSize = isNarrow
-        ? (screenWidth - 80).clamp(150.0, 200.0)
+        ? (context.screenWidth - 80).clamp(150.0, 200.0)
         : coverSize;
 
     final titleWidget = Text(
@@ -351,7 +482,7 @@ class CommonDetailHeader extends StatelessWidget {
     );
 
     return Padding(
-      padding: EdgeInsets.all(isNarrow ? 20 : 40),
+      padding: EdgeInsets.all(context.horizontalPadding),
       child: isNarrow
           ? Column(
               children: [
@@ -434,85 +565,6 @@ class _CommonVolumeSliderState extends State<CommonVolumeSlider> {
   }
 }
 
-class AudioDeviceButton extends StatefulWidget {
-  final double iconSize;
-  const AudioDeviceButton({super.key, this.iconSize = 18});
-
-  @override
-  State<AudioDeviceButton> createState() => _AudioDeviceButtonState();
-}
-
-class _AudioDeviceButtonState extends State<AudioDeviceButton> {
-  bool _devicesLoaded = false;
-
-  @override
-  void initState() {
-    super.initState();
-    unawaited(_loadDevices());
-  }
-
-  Future<void> _loadDevices() async {
-    await refreshAudioDevices();
-    if (mounted) {
-      setState(() => _devicesLoaded = true);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SignalBuilder(
-      builder: (context) {
-        final devices = audioDevicesSignal.value;
-        final selectedDevice = selectedAudioDeviceSignal.value;
-        // No accent subscription while the hosting tab is hidden.
-        final accentColor = visibleSignal<Color>(context, accentColorSignal);
-
-        final items = [
-          AppContextMenuItem<String>(
-            value: '',
-            label: 'По умолчанию',
-            icon: Icons.computer_rounded,
-            isSelected: selectedDevice == null,
-            color: selectedDevice == null ? accentColor : null,
-          ),
-          ...devices.map(
-            (device) => AppContextMenuItem<String>(
-              value: device,
-              label: device,
-              icon: Icons.speaker_rounded,
-              isSelected: device == selectedDevice,
-              color: device == selectedDevice ? accentColor : null,
-            ),
-          ),
-        ];
-
-        return AppContextMenu<String>(
-          onOpen: () {
-            if (!_devicesLoaded) {
-              unawaited(_loadDevices());
-            }
-          },
-          onSelected: (value) {
-            unawaited(setAudioDevice(value));
-          },
-          items: items,
-          child: IconButton(
-            icon: Icon(
-              Icons.speaker_group_rounded,
-              size: widget.iconSize,
-              color: selectedDevice != null
-                  ? accentColor
-                  : Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-            tooltip: selectedDevice ?? 'Устройство вывода',
-            onPressed: null, // AppContextMenu handles clicks
-          ),
-        );
-      },
-    );
-  }
-}
-
 typedef DataBuilder<T> = Widget Function(BuildContext context, T data);
 
 /// Renders screen-level async data held in a `FutureSignal`.
@@ -537,6 +589,7 @@ class CommonAsyncView<T> extends StatelessWidget {
   final Widget Function(String error)? error;
   final Widget? empty;
   final bool Function(T data)? isEmpty;
+  final VoidCallback? onRetry;
 
   const CommonAsyncView({
     required this.state,
@@ -546,6 +599,7 @@ class CommonAsyncView<T> extends StatelessWidget {
     this.error,
     this.empty,
     this.isEmpty,
+    this.onRetry,
   });
 
   @override
@@ -558,9 +612,13 @@ class CommonAsyncView<T> extends StatelessWidget {
         return builder(context, data);
       },
       loading: () => loading ?? const CommonLoadingWidget(),
-      error: (Object e, _) => error != null
-          ? error!(humanizeError(e))
-          : CommonErrorWidget(error: e),
+      // The single nullable parameter is deliberate: signals' AsyncState.map
+      // only recognizes the error callback through `is Function(dynamic)`, and
+      // an `(Object e, _)` closure fails that check and is then called with no
+      // arguments. `Object?` is the narrowest type that still matches.
+      error: (Object? e) => error != null
+          ? error!(humanizeError(e!))
+          : CommonErrorWidget(error: e!, onRetry: onRetry),
     );
   }
 }
@@ -602,7 +660,12 @@ class CommonDetailSliverLayout extends StatelessWidget {
 
 /// Shared pull-to-refresh for the whole app: branded colors,
 /// triggers on the top edge only.
-class AppRefreshIndicator extends StatelessWidget {
+///
+/// The M3E header pushes the list down while pulling. Left alone it also lets
+/// the list scroll up during the same drag, so the header closes while the
+/// content runs away under it; [_PullHold] pins the list at the top for as long
+/// as the header is open, and the drag only moves the header.
+class AppRefreshIndicator extends StatefulWidget {
   final Future<void> Function() onRefresh;
   final Widget child;
 
@@ -613,16 +676,97 @@ class AppRefreshIndicator extends StatelessWidget {
   });
 
   @override
+  State<AppRefreshIndicator> createState() => _AppRefreshIndicatorState();
+}
+
+class _AppRefreshIndicatorState extends State<AppRefreshIndicator> {
+  final _pull = M3EPullToRefreshController();
+
+  /// The header is open and belongs to the finger: not a running refresh,
+  /// whose header stays open while the list must stay scrollable.
+  bool get _held => _pull.distanceFraction > 0 && !_pull.isRefreshing;
+
+  @override
+  void dispose() {
+    _pull.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     return M3EPullToRefreshIndicator(
-      onRefresh: onRefresh,
+      controller: _pull,
+      onRefresh: widget.onRefresh,
       style: M3EPullToRefreshStyle(
         indicatorColor: cs.primary,
         containerColor: cs.surfaceContainerHighest,
       ),
-      child: child,
+      child: _PullHold(held: () => _held, child: widget.child),
     );
+  }
+}
+
+/// Keeps the scroll view at the top while [held] and reports the swallowed
+/// drag back as a scroll update, which is what the M3E header listens to.
+class _PullHold extends StatelessWidget {
+  final bool Function() held;
+  final Widget child;
+
+  const _PullHold({required this.held, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    final behavior = ScrollConfiguration.of(context);
+    return ScrollConfiguration(
+      behavior: behavior.copyWith(
+        physics: _PullHoldPhysics(
+          held: held,
+          parent: behavior.getScrollPhysics(context),
+        ),
+      ),
+      child: NotificationListener<ScrollNotification>(
+        onNotification: (notification) {
+          if (notification is OverscrollNotification &&
+              notification.overscroll > 0 &&
+              notification.dragDetails != null &&
+              notification.context != null &&
+              held()) {
+            ScrollUpdateNotification(
+              metrics: notification.metrics,
+              context: notification.context!,
+              dragDetails: notification.dragDetails,
+              scrollDelta: notification.overscroll,
+            ).dispatch(notification.context);
+          }
+          return false;
+        },
+        child: child,
+      ),
+    );
+  }
+}
+
+class _PullHoldPhysics extends ScrollPhysics {
+  final bool Function() held;
+
+  const _PullHoldPhysics({required this.held, super.parent});
+
+  @override
+  _PullHoldPhysics applyTo(ScrollPhysics? ancestor) =>
+      _PullHoldPhysics(held: held, parent: buildParent(ancestor));
+
+  @override
+  double applyBoundaryConditions(ScrollMetrics position, double value) {
+    // Refuse to scroll down while the header is open; the whole delta comes
+    // back as overscroll, which [_PullHold] turns into a header drag.
+    if (held() &&
+        position.axis == Axis.vertical &&
+        position.pixels <= position.minScrollExtent &&
+        value > position.pixels) {
+      return value - position.pixels;
+    }
+    return super.applyBoundaryConditions(position, value);
   }
 }
 
@@ -1190,41 +1334,80 @@ Future<String?> showTextPromptDialog(
   String? initial,
   bool autofocus = false,
 }) {
-  final controller = TextEditingController(text: initial);
-  final cs = Theme.of(context).colorScheme;
-
   return showDialog<String>(
     context: context,
-    builder: (dialogContext) {
-      void close([String? value]) =>
-          Navigator.of(dialogContext).pop<String>(value);
+    builder: (dialogContext) => _TextPromptDialog(
+      title: title,
+      hint: hint,
+      confirmLabel: confirmLabel,
+      initial: initial,
+      autofocus: autofocus,
+    ),
+  ).then((value) => value?.trim());
+}
 
-      return AppDialog(
-        title: title,
-        content: TextField(
-          controller: controller,
-          autofocus: autofocus,
-          style: TextStyle(color: cs.onSurface),
-          decoration: InputDecoration(
-            hintText: hint,
-            hintStyle: TextStyle(color: cs.onSurface.withValues(alpha: 0.24)),
-            filled: true,
-            fillColor: cs.onSurface.withValues(alpha: 0.05),
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(AppRadius.sm),
-              borderSide: BorderSide.none,
-            ),
+/// Owns its [TextEditingController] so it is disposed with the dialog widget.
+class _TextPromptDialog extends StatefulWidget {
+  final String title;
+  final String hint;
+  final String confirmLabel;
+  final String? initial;
+  final bool autofocus;
+
+  const _TextPromptDialog({
+    required this.title,
+    required this.hint,
+    required this.confirmLabel,
+    required this.initial,
+    required this.autofocus,
+  });
+
+  @override
+  State<_TextPromptDialog> createState() => _TextPromptDialogState();
+}
+
+class _TextPromptDialogState extends State<_TextPromptDialog> {
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.initial,
+  );
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _close([String? value]) => Navigator.of(context).pop<String>(value);
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    return AppDialog(
+      title: widget.title,
+      content: TextField(
+        controller: _controller,
+        autofocus: widget.autofocus,
+        style: TextStyle(color: cs.onSurface),
+        decoration: InputDecoration(
+          hintText: widget.hint,
+          hintStyle: TextStyle(color: cs.onSurface.withValues(alpha: 0.24)),
+          filled: true,
+          fillColor: cs.onSurface.withValues(alpha: 0.05),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(AppRadius.sm),
+            borderSide: BorderSide.none,
           ),
-          onSubmitted: close,
         ),
-        actions: [
-          AppDialog.cancelButton(dialogContext),
-          M3EFilledButton(
-            onPressed: () => close(controller.text),
-            child: Text(confirmLabel),
-          ),
-        ],
-      );
-    },
-  ).then((value) => value?.trim()).whenComplete(controller.dispose);
+        onSubmitted: _close,
+      ),
+      actions: [
+        AppDialog.cancelButton(context),
+        M3EFilledButton(
+          onPressed: () => _close(_controller.text),
+          child: Text(widget.confirmLabel),
+        ),
+      ],
+    );
+  }
 }

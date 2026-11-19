@@ -31,16 +31,15 @@ class YaymaAudioHandler extends BaseAudioHandler {
           localCoverUriSignal().value ??
           (meta.coverUrl != null ? Uri.parse(meta.coverUrl!) : null);
 
-      // Use peek() to avoid rebuilding the notification every time the duration ticks
-      final progress = trackProgressSignal.peek();
-
+      // Duration comes from the track itself: the progress snapshot still
+      // belongs to the previous track for a moment after a switch.
       mediaItem.add(
         MediaItem(
           id: meta.id!,
-          album: meta.albumId,
+          album: meta.album,
           title: meta.title,
           artist: meta.artists.map((a) => a.name).join(', '),
-          duration: Duration(milliseconds: progress.durationMs.toInt()),
+          duration: Duration(milliseconds: meta.durationMs),
           artUri: artUri,
           extras: {'version': meta.version, 'codec': meta.codec},
         ),
@@ -164,20 +163,28 @@ class YaymaAudioHandler extends BaseAudioHandler {
 
   @override
   Future<void> setRepeatMode(AudioServiceRepeatMode repeatMode) async {
-    // Current PlaybackController only supports toggle, but we could implement direct set if needed
-    // For now, just toggle if it doesn't match
-    final current = repeatModeSignal();
-    if (_mapRepeatMode(current) != repeatMode) {
-      await PlaybackController.toggleRepeat();
+    // Direct set, not toggle emulation: with a toggle, a request from `none`
+    // for `one` would land on `all` (one toggle = next mode in the cycle).
+    await PlaybackController.setRepeatMode(_mapToDtoRepeatMode(repeatMode));
+  }
+
+  rust.RepeatModeDto _mapToDtoRepeatMode(AudioServiceRepeatMode repeatMode) {
+    switch (repeatMode) {
+      case AudioServiceRepeatMode.all:
+      case AudioServiceRepeatMode.group:
+        return rust.RepeatModeDto.all;
+      case AudioServiceRepeatMode.one:
+        return rust.RepeatModeDto.single;
+      case AudioServiceRepeatMode.none:
+        return rust.RepeatModeDto.none;
     }
   }
 
   @override
   Future<void> setShuffleMode(AudioServiceShuffleMode shuffleMode) async {
-    final current = isShuffledSignal();
-    final target = shuffleMode == AudioServiceShuffleMode.all;
-    if (current != target) {
-      await PlaybackController.toggleShuffle();
-    }
+    // Direct set: all/group mean "shuffled", none means "not shuffled".
+    await PlaybackController.setShuffle(
+      enabled: shuffleMode != AudioServiceShuffleMode.none,
+    );
   }
 }

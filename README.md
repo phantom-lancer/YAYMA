@@ -18,18 +18,18 @@
 
 ## Предупреждение
 
-**YAYMA** основан на [YaMusic](https://github.com/yamusic/yamusic) и использует неофициальное API, не предназначенное для публичного использования. Проект находится в стадии активной разработки. Пользуйтесь на свой страх и риск. Проект написан с помощью ИИ.
+**YAYMA** - неофициальный клиент для личного использования, основан на [YaMusic](https://github.com/yamusic/yamusic). Он не связан с «Яндексом» и **не одобрен** им; названия и товарные знаки принадлежат их владельцам. Используется API, не предназначенное для публичного использования, поэтому за соблюдение правил сервиса и риск блокировки аккаунта отвечаете вы. Проект написан с помощью ИИ.
 
 ## Возможности
 
-- **Приватность**: никакой аналитики и слежки со стороны клиента
-- **Тексты песен**: несколько источников (LrcLib, BetterLyrics, YouLyPlus), включая пословную синхронизацию
+- **Приватность**: никакой аналитики не нужной для музыки
+- **Тексты песен**: несколько источников (LrcLib, LrcMux, BetterLyrics), включая пословную синхронизацию
 - **Интеграция с системой**: управление из панели задач Windows, Discord Rich Presence, глобальные горячие клавиши
 
 ## Благодарности ❤️
 
 - [Vyfor](https://github.com/vyfor) — за исходный TUI-клиент [YaMusic](https://github.com/yamusic/yamusic) и библиотеку [yandex-music-rs](https://github.com/vyfor/yandex-music-rs) для работы с API Яндекса
-- [LrcLib](https://lrclib.net), [BetterLyrics](https://github.com/better-lyrics/better-lyrics), [YouLyPlus](https://github.com/ibratabian17/YouLyPlus) — за базы текстов песен
+- [LrcLib](https://lrclib.net), [LrcMux](https://lrcmux.dev), [BetterLyrics](https://github.com/better-lyrics/better-lyrics) — за базы текстов песен
 - [Metrolist](https://github.com/MetrolistGroup/Metrolist) — за референс полноэкранного режима текстов
 
 ## Лицензия

@@ -18,15 +18,31 @@ pub struct SmtcManager {
     http_cache: std::sync::Arc<crate::storage::cache::HttpCache>,
     #[cfg(target_os = "windows")]
     thumbnail_manager: Option<ThumbnailManager>,
+    /// Incremented per metadata update so a slow cover load can't replace the
+    /// artwork of a track that was started after it.
+    #[cfg(target_os = "windows")]
+    cover_seq: u64,
+}
+
+impl Drop for SmtcManager {
+    fn drop(&mut self) {
+        // souvlaki has no Drop of its own and the Windows SMTC is a
+        // per-window singleton: without an explicit detach, every re-login
+        // stacks another dead event handler on the same control.
+        let _ = self.controls.detach();
+    }
 }
 
 impl SmtcManager {
     pub fn new(
         cmd_tx: mpsc::UnboundedSender<AudioMessage>,
-        #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
-        http_cache: std::sync::Arc<crate::storage::cache::HttpCache>,
+        #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] http_cache: std::sync::Arc<
+            crate::storage::cache::HttpCache,
+        >,
+        current_track_id: crate::util::reactive::Signal<Option<String>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         #[cfg(target_os = "windows")]
+        // SAFETY: pure Win32 call taking a static NUL-terminated wide string.
         unsafe {
             let _ = SetCurrentProcessExplicitAppUserModelID(w!("com.darkplayoff.yayma"));
         }
@@ -68,7 +84,8 @@ impl SmtcManager {
                     let _ = cmd_tx_clone.send(AudioMessage::Stop);
                 }
                 MediaControlEvent::SetPosition(pos) => {
-                    let _ = cmd_tx_clone.send(AudioMessage::Seek(pos.0));
+                    let _ =
+                        cmd_tx_clone.send(AudioMessage::Seek(pos.0, current_track_id.get()));
                 }
                 _ => {}
             })
@@ -92,6 +109,8 @@ impl SmtcManager {
             http_cache,
             #[cfg(target_os = "windows")]
             thumbnail_manager,
+            #[cfg(target_os = "windows")]
+            cover_seq: 0,
         })
     }
 
@@ -114,13 +133,15 @@ impl SmtcManager {
 
         #[cfg(target_os = "windows")]
         if let (Some(url), Some(thumb_mgr)) = (&cover_url, self.thumbnail_manager) {
+            self.cover_seq = self.cover_seq.wrapping_add(1);
+            let seq = self.cover_seq;
             let url_clone = url.clone();
             let cache = self.http_cache.clone();
             tokio::spawn(async move {
                 if let Ok(path) = cache.get_file(&url_clone).await
                     && let Ok(bytes) = tokio::fs::read(path).await
                 {
-                    thumb_mgr.update_cover(bytes);
+                    thumb_mgr.update_cover(seq, bytes);
                 }
             });
         }
@@ -134,7 +155,7 @@ impl SmtcManager {
         };
 
         if let Err(e) = self.controls.set_metadata(metadata) {
-            tracing::error!("Failed to update SMTC metadata: {:?}", e);
+            tracing::error!(error = ?e, "smtc_metadata_update_failed");
         }
     }
 
@@ -146,7 +167,7 @@ impl SmtcManager {
         };
 
         if let Err(e) = self.controls.set_playback(status) {
-            tracing::error!("Failed to update SMTC playback status: {:?}", e);
+            tracing::error!(error = ?e, "smtc_playback_status_update_failed");
         }
     }
 }

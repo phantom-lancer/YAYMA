@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -13,7 +12,10 @@ import 'package:yayma/src/app/init.dart';
 import 'package:yayma/src/app/session.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
 import 'package:yayma/src/features/core/services/app_error.dart';
+import 'package:yayma/src/features/core/services/app_logger.dart';
+import 'package:yayma/src/features/core/services/rust_bridge.dart';
 import 'package:yayma/src/features/core/views/layout.dart';
+import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
 import 'package:yayma/src/features/core/views/widgets/smooth_scroll.dart';
 import 'package:yayma/src/features/settings/services/update_service.dart';
 import 'package:yayma/src/features/settings/views/update_dialog.dart';
@@ -46,15 +48,25 @@ class _RootScreenState extends State<RootScreen> {
                     unawaited(() async {
                       final ctx = appContextSignal.value;
                       if (ctx == null) return;
-                      final state = await rust.restoreSavedState(ctx: ctx);
-                      if (state != null) {
-                        await rust.restoreAndPlay(
+                      final state = await runRustFetch(
+                        (ctx) => rust.restoreSavedState(ctx: ctx),
+                        notifyErrors: false,
+                      );
+                      // A logout/login during the fetch must not restore
+                      // playback into the session that replaced this one.
+                      if (state == null ||
+                          !identical(appContextSignal.value, ctx)) {
+                        return;
+                      }
+                      await runRustFetch(
+                        (ctx) => rust.restoreAndPlay(
                           ctx: ctx,
                           trackId: state.trackId,
                           positionMs: state.positionMs,
                           isPlaying: false,
-                        );
-                      }
+                        ),
+                        notifyErrors: false,
+                      );
 
                       // Auto check for updates on launch if enabled
                       unawaited(() async {
@@ -70,7 +82,7 @@ class _RootScreenState extends State<RootScreen> {
                             }
                           }
                         } on Object catch (e) {
-                          debugPrint('Error checking for updates: $e');
+                          appLog(AppLogLevel.warn, 'update check failed: $e');
                         }
                       }());
                     }());
@@ -81,8 +93,12 @@ class _RootScreenState extends State<RootScreen> {
             }
             return const LoginScreen();
           },
-          error: (Object e, _) =>
-              Scaffold(body: Center(child: Text(humanizeError(e)))),
+          // Single nullable parameter, see the note in CommonAsyncView.
+          // No retry button: the failures that reach this screen (bridge,
+          // data dir, db) are persistent, and the transient ones never get
+          // here — auto-login errors collapse into the login screen.
+          error: (Object? e) =>
+              Scaffold(body: CommonErrorWidget(error: e!)),
           loading: () =>
               const Scaffold(body: Center(child: M3ELoadingIndicator())),
         );
@@ -144,7 +160,10 @@ class _LoginScreenState extends State<LoginScreen> {
     var token = val.trim();
     try {
       token = Uri.decodeFull(token);
-    } on Object catch (_) {}
+    } on Object catch (e) {
+      // Not fatal — the raw token often still works — but worth logging.
+      appLog(AppLogLevel.warn, 'token URI decode failed: $e');
+    }
 
     token = token.replaceAll(RegExp(r'[\u200B-\u200D\uFEFF\u00A0]'), '');
     token = token.replaceAll(RegExp(r'[^\x21-\x7E]'), '');
@@ -327,12 +346,20 @@ class _LoginScreenState extends State<LoginScreen> {
                 ),
               ),
               if (isCustomTitlebar)
-                const Positioned(
+                // Not const: WindowCaption holds a Finalizable field, and the
+                // incremental compiler then fails with "A const constructor
+                // can't have a body" (dart-lang/sdk#64487).
+                // ignore: prefer_const_constructors
+                Positioned(
                   top: 0,
                   left: 0,
                   right: 0,
+                  // dart-lang/sdk#64487 above
+                  // ignore: prefer_const_constructors
                   child: SizedBox(
                     height: 32,
+                    // dart-lang/sdk#64487 above
+                    // ignore: prefer_const_constructors
                     child: WindowCaption(
                       brightness: Brightness.dark,
                       backgroundColor: Colors.transparent,
@@ -541,88 +568,53 @@ class _YandexDeviceLoginDialogState extends State<YandexDeviceLoginDialog> {
   }
 
   Future<void> _initDeviceFlow() async {
-    final client = HttpClient();
     try {
-      final request = await client.postUrl(
-        Uri.parse('https://oauth.yandex.ru/device/code'),
-      );
-      request.headers.set('content-type', 'application/x-www-form-urlencoded');
-      request.write('client_id=23cabbbdc6cd418abb4b39c32c41195d');
-      final response = await request.close();
-      final body = await response.transform(utf8.decoder).join();
+      final code = await rust.yandexDeviceCode();
 
-      if (response.statusCode == 200) {
-        final data = jsonDecode(body) as Map<String, dynamic>;
-        setState(() {
-          _userCode = data['user_code'] as String?;
-          _deviceCode = data['device_code'] as String?;
-          _verificationUrl = data['verification_url'] as String?;
-          _interval = (data['interval'] as num?)?.toInt() ?? 5;
-          _isLoading = false;
-        });
-        _startPolling();
-      } else {
-        setState(() {
-          _error = 'Не удалось получить код устройства от Яндекс.';
-          _isLoading = false;
-        });
-      }
+      if (!mounted) return;
+      setState(() {
+        _userCode = code.userCode;
+        _deviceCode = code.deviceCode;
+        _verificationUrl = code.verificationUrl;
+        _interval = code.interval;
+        _isLoading = false;
+      });
+      _startPolling();
     } on Object catch (e) {
+      if (!mounted) return;
       setState(() {
         _error = humanizeError(e);
         _isLoading = false;
       });
-    } finally {
-      client.close();
     }
   }
 
   void _startPolling() {
+    _timer?.cancel();
     _timer = Timer.periodic(Duration(seconds: _interval), (timer) {
       unawaited(_pollToken());
     });
   }
 
   Future<void> _pollToken() async {
-    if (_isFinalized || _deviceCode == null) return;
+    final deviceCode = _deviceCode;
+    if (_isFinalized || deviceCode == null) return;
 
-    final client = HttpClient();
     try {
-      final request = await client.postUrl(
-        Uri.parse('https://oauth.yandex.ru/token'),
-      );
-      request.headers.set('content-type', 'application/x-www-form-urlencoded');
-      request.write(
-        'grant_type=device_code'
-        '&client_id=23cabbbdc6cd418abb4b39c32c41195d'
-        '&client_secret=53bc75238f0c4d08a118e51fe9203300'
-        '&code=$_deviceCode',
-      );
-      final response = await request.close();
-      final body = await response.transform(utf8.decoder).join();
-      final data = jsonDecode(body) as Map<String, dynamic>;
-
-      if (response.statusCode == 200) {
-        final token = data['access_token'] as String?;
-        if (token != null) {
-          _timer?.cancel();
-          await _handleFoundToken(token);
-        }
-      } else {
-        final error = data['error'] as String?;
-        if (error != 'authorization_pending') {
-          _timer?.cancel();
-          setState(() {
-            _error =
-                data['error_description'] as String? ??
-                'Ошибка авторизации ($error).';
-          });
-        }
+      final result = await rust.yandexDeviceToken(deviceCode: deviceCode);
+      final token = result.accessToken;
+      if (token != null) {
+        _timer?.cancel();
+        await _handleFoundToken(token);
+      } else if (result.error != null) {
+        _timer?.cancel();
+        if (!mounted) return;
+        setState(() {
+          _error = result.error;
+        });
       }
     } on Object catch (e) {
-      debugPrint('Error polling token: $e');
-    } finally {
-      client.close();
+      appLog(AppLogLevel.warn, 'device token polling failed: $e');
     }
   }
 
@@ -645,7 +637,7 @@ class _YandexDeviceLoginDialogState extends State<YandexDeviceLoginDialog> {
           await launchUrl(uri, mode: LaunchMode.externalApplication);
         }
       } on Object catch (e) {
-        debugPrint('Error launching browser: $e');
+        appLog(AppLogLevel.warn, 'error launching browser: $e');
       }
     }());
   }

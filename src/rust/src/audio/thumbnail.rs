@@ -1,18 +1,19 @@
+use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use windows::{
     Win32::Foundation::*, Win32::Graphics::Dwm::*, Win32::Graphics::Gdi::*,
-    Win32::Graphics::Imaging::*, Win32::System::Com::*, Win32::System::Threading::GetCurrentProcessId,
-    Win32::UI::Shell::SetWindowSubclass, Win32::UI::Shell::*, Win32::UI::WindowsAndMessaging::*,
-    core::*,
+    Win32::Graphics::Imaging::*, Win32::System::Com::*,
+    Win32::System::Threading::GetCurrentProcessId, Win32::UI::Shell::SetWindowSubclass,
+    Win32::UI::Shell::*, Win32::UI::WindowsAndMessaging::*, core::*,
 };
 
 const SUBCLASS_ID: usize = 1337;
 const WM_APP_REMOTECALL: u32 = WM_APP + 1337;
-/// Posted by `taskbar.rs` with a heap-allocated `taskbar::UiCmd` in LPARAM;
-/// the subclass executes it on the platform thread and frees the box.
+/// Posted by `taskbar.rs` once it has stored a `taskbar::UiCmd` in its own
+/// mailbox; the subclass runs it on the platform thread.
 pub const WM_APP_TASKBAR: u32 = WM_APP + 1338;
 
 /// Maximum number of DWM-requested sizes (thumbnail + live preview) tracked
@@ -39,6 +40,12 @@ static REQUESTED_SIZES: LazyLock<Mutex<Vec<(u32, u32)>>> = LazyLock::new(|| Mute
 /// Hash of the cover currently (or last) shown via DWM, to skip redundant
 /// invalidations when SMTC re-reports the same track's artwork.
 static INVALIDATED_HASH: AtomicU64 = AtomicU64::new(0);
+/// Id of the newest `update_cover` call, assigned by the caller. A cover that
+/// loads slower than the next one must not win, so every stage checks it.
+static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
+/// One-slot mailbox for the prerender thread: a newer job overwrites an older
+/// one instead of queueing, so a burst of tracks can't pile up cover bytes.
+static PENDING: LazyLock<ArcSwapOption<PrerenderJob>> = LazyLock::new(ArcSwapOption::empty);
 
 thread_local! {
     static WIC_FACTORY: RefCell<Option<IWICImagingFactory>> = const { RefCell::new(None) };
@@ -51,7 +58,13 @@ pub struct ThumbnailManager {
     hwnd_ptr: isize,
 }
 
+/// Only a raw `HWND` value is stored; the manager itself owns no COM/GDI
+/// objects. Every Win32 call made with that handle (`IsWindow`,
+/// `DwmInvalidateIconicBitmaps`) is documented to be valid from any thread.
+// SAFETY: matches the guarantee above — the handle is only ever used from
+// calls that accept it cross-thread, and no owned object is shared.
 unsafe impl Send for ThumbnailManager {}
+// SAFETY: same as the `Send` impl above; `&ThumbnailManager` only reads that handle.
 unsafe impl Sync for ThumbnailManager {}
 
 impl ThumbnailManager {
@@ -59,20 +72,37 @@ impl ThumbnailManager {
         let target_hwnd = if hwnd_raw.is_null() {
             get_flutter_hwnd()?
         } else {
-            HWND(hwnd_raw as *mut _)
+            HWND(hwnd_raw.cast())
         };
 
+        // `SetWindowsHookExW` runs `hook_proc` on the target thread's message
+        // loop, which is where the DWM attributes and the subclass must be set.
+        // SAFETY: `target_hwnd` comes from `get_flutter_hwnd` and is a live window.
+        let thread_id = unsafe { GetWindowThreadProcessId(target_hwnd, None) };
+        if thread_id == 0 {
+            return None;
+        }
+        let hook =
+            // SAFETY: no DLL module is passed (`None`), so the hook lives in this
+            // process and is removed before the module unloads.
+            match unsafe { SetWindowsHookExW(WH_CALLWNDPROC, Some(hook_proc), None, thread_id) } {
+                Ok(hook) => hook,
+                Err(e) => {
+                    tracing::warn!(?e, "thumbnail_hook_install_failed");
+                    return None;
+                }
+            };
+        // SAFETY: `hook` is the live hook handle just installed and `target_hwnd`
+        // is a live window; `SendMessageW` blocks until the target thread runs
+        // `hook_proc`, which is what installs the DWM attributes on that thread.
         unsafe {
-            let thread_id = GetWindowThreadProcessId(target_hwnd, None);
-            if let Ok(hook) = SetWindowsHookExW(WH_CALLWNDPROC, Some(hook_proc), None, thread_id) {
-                HOOK_HANDLE.store(hook.0 as isize, Ordering::Relaxed);
-                let _ = SendMessageW(
-                    target_hwnd,
-                    WM_APP_REMOTECALL,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(0)),
-                );
-            }
+            HOOK_HANDLE.store(hook.0 as isize, Ordering::Relaxed);
+            let _ = SendMessageW(
+                target_hwnd,
+                WM_APP_REMOTECALL,
+                Some(WPARAM(0)),
+                Some(LPARAM(0)),
+            );
         }
 
         Some(Self {
@@ -80,7 +110,13 @@ impl ThumbnailManager {
         })
     }
 
-    pub fn update_cover(&self, img_bytes: Vec<u8>) {
+    /// Hand a freshly loaded cover to the thumbnail pipeline. `seq` must grow
+    /// monotonically across calls, otherwise a slow load overwrites a newer
+    /// cover (or is discarded as stale).
+    pub fn update_cover(&self, seq: u64, img_bytes: Vec<u8>) {
+        if LAST_SEQ.fetch_max(seq, Ordering::Relaxed) > seq {
+            return;
+        }
         let hash = cover_hash(&img_bytes);
         if INVALIDATED_HASH.load(Ordering::Relaxed) == hash {
             return;
@@ -92,40 +128,48 @@ impl ThumbnailManager {
             bytes: bytes.clone(),
         });
 
-        // Don't delete the current bitmaps here: they are replaced only after
-        // the prerendered ones are installed, and DWM may still be reading
-        // them. Just invalidate so DWM re-requests.
+        // Live bitmaps are replaced only after new ones are ready, so the
+        // preview never flashes empty in between.
         let sizes = REQUESTED_SIZES.lock().clone();
         if sizes.is_empty() {
-            // DWM has never asked yet; the first request will decode
-            // LAST_COVER synchronously. Nothing to invalidate into.
+            // DWM never asked yet; the first request decodes LAST_COVER inline.
             INVALIDATED_HASH.store(hash, Ordering::Relaxed);
             return;
         }
 
-        let hwnd = self.hwnd_ptr;
-        prerender_sender().send(PrerenderJob {
+        enqueue_prerender(PrerenderJob {
+            seq,
             hash,
             bytes,
-            hwnd,
-        }).ok();
+            hwnd: self.hwnd_ptr,
+        });
     }
 }
 
 struct PrerenderJob {
+    seq: u64,
     hash: u64,
     bytes: Arc<Vec<u8>>,
     hwnd: isize,
 }
 
-fn prerender_sender() -> &'static std::sync::mpsc::Sender<PrerenderJob> {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<PrerenderJob>> = OnceLock::new();
+fn enqueue_prerender(job: PrerenderJob) {
+    PENDING.store(Some(Arc::new(job)));
+    let _ = wake_sender().send(());
+}
+
+fn wake_sender() -> &'static std::sync::mpsc::Sender<()> {
+    static SENDER: OnceLock<std::sync::mpsc::Sender<()>> = OnceLock::new();
     SENDER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<PrerenderJob>();
-        std::thread::Builder::new()
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        if let Err(e) = std::thread::Builder::new()
             .name("thumbnail-prerender".into())
             .spawn(move || prerender_loop(rx))
-            .expect("spawn thumbnail prerender thread");
+        {
+            // Without the thread the sync path in `handle_iconic_request`
+            // still works, just without prerendering.
+            tracing::warn!(?e, "thumbnail_prerender_spawn_failed");
+        }
         tx
     })
 }
@@ -134,34 +178,41 @@ fn prerender_sender() -> &'static std::sync::mpsc::Sender<PrerenderJob> {
 /// thread. The WIC decode of a JPEG cover takes tens of milliseconds; doing
 /// it inside `subclass_proc` used to stall the Flutter platform thread and
 /// starve DWM's iconic-bitmap requests (the "loading" glass in the preview).
-fn prerender_loop(rx: std::sync::mpsc::Receiver<PrerenderJob>) {
+fn prerender_loop(rx: std::sync::mpsc::Receiver<()>) {
     ensure_com();
-    while let Ok(job) = rx.recv() {
-        // A newer cover arrived while we were queued: drop this one entirely,
-        // the newer job will render it.
-        if LAST_COVER.lock().as_ref().map(|c| c.hash) != Some(job.hash) {
+    while rx.recv().is_ok() {
+        let Some(job) = PENDING.swap(None) else {
+            continue;
+        };
+        if !is_current(&job) {
             continue;
         }
 
         let sizes = REQUESTED_SIZES.lock().clone();
         let mut installed_any = false;
         for (tw, th) in sizes {
-            if let Some(h) = create_hbitmap_from_wic(&job.bytes, tw, th) {
-                let mut ready = READY_BITMAPS.lock();
-                if LAST_COVER.lock().as_ref().map(|c| c.hash) != Some(job.hash) {
-                    unsafe {
-                        let _ = DeleteObject(HBITMAP(h.0 as *mut _).into());
-                    }
-                    break;
+            let Some(h) = create_hbitmap_from_wic(&job.bytes, tw, th) else {
+                tracing::warn!(tw, th, "thumbnail_decode_failed");
+                continue;
+            };
+            let mut ready = READY_BITMAPS.lock();
+            if !is_current(&job) {
+                // SAFETY: `h` is an HBITMAP we created for this job and never
+                // handed to DWM, so this is the only owner releasing it.
+                unsafe {
+                    let _ = DeleteObject(HBITMAP(h.0.cast()).into());
                 }
-                replace_ready_bitmap(&mut ready, tw, th, h);
-                installed_any = true;
+                break;
             }
+            replace_ready_bitmap(&mut ready, tw, th, h);
+            installed_any = true;
         }
 
         if installed_any {
             INVALIDATED_HASH.store(job.hash, Ordering::Relaxed);
             let hwnd = HWND(job.hwnd as *mut _);
+            // SAFETY: `hwnd` was captured from the live Flutter window; both calls
+            // are documented to accept a stale handle and return an error instead.
             unsafe {
                 if IsWindow(Some(hwnd)).as_bool() {
                     let _ = DwmInvalidateIconicBitmaps(hwnd);
@@ -171,19 +222,25 @@ fn prerender_loop(rx: std::sync::mpsc::Receiver<PrerenderJob>) {
     }
 }
 
+/// A newer cover arrived while this job was queued or decoding.
+fn is_current(job: &PrerenderJob) -> bool {
+    job.seq >= LAST_SEQ.load(Ordering::Relaxed)
+        && LAST_COVER.lock().as_ref().map(|c| c.hash) == Some(job.hash)
+}
+
 /// Replace (or add) the cached bitmap for `(tw, th)`, deleting the evicted
 /// HBITMAP. Caller holds `READY_BITMAPS`.
 fn replace_ready_bitmap(ready: &mut Vec<CachedBitmap>, tw: u32, th: u32, h: HBITMAP) {
-    if let Some(pos) = ready
-        .iter()
-        .position(|c| c.width == tw && c.height == th)
-    {
+    if let Some(pos) = ready.iter().position(|c| c.width == tw && c.height == th) {
         let old = ready.remove(pos);
+        // SAFETY: `old` was removed from the ready list, so no live request can
+        // still hand this bitmap to DWM; we are its last owner.
         unsafe {
             let _ = DeleteObject(HBITMAP(old.hbitmap_ptr as *mut _).into());
         }
     } else if ready.len() >= MAX_READY_BITMAPS {
         let old = ready.remove(0);
+        // SAFETY: same as above — evicted from the list before being freed.
         unsafe {
             let _ = DeleteObject(HBITMAP(old.hbitmap_ptr as *mut _).into());
         }
@@ -196,6 +253,8 @@ fn replace_ready_bitmap(ready: &mut Vec<CachedBitmap>, tw: u32, th: u32, h: HBIT
 }
 
 fn set_iconic_bitmap(hwnd: HWND, msg: u32, h: HBITMAP) {
+    // SAFETY: `hwnd`/`h` belong to a thumbnail request DWM just delivered, and the
+    // bitmap is still owned by us here; DWM copies it during the call.
     unsafe {
         if msg == WM_DWMSENDICONICTHUMBNAIL {
             let _ = DwmSetIconicThumbnail(hwnd, h, 0);
@@ -207,6 +266,8 @@ fn set_iconic_bitmap(hwnd: HWND, msg: u32, h: HBITMAP) {
 
 pub fn get_flutter_hwnd() -> Option<HWND> {
     let mut target_hwnd = HWND::default();
+    // SAFETY: `enum_windows_proc` only writes through the `*mut HWND` we pass in,
+    // which stays alive for the duration of the call.
     unsafe {
         let _ = EnumWindows(
             Some(enum_windows_proc),
@@ -217,6 +278,8 @@ pub fn get_flutter_hwnd() -> Option<HWND> {
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // SAFETY: Windows passes a live window handle; `lparam` is the
+    // `*mut HWND` handed to `EnumWindows` in `get_flutter_hwnd`.
     unsafe {
         let mut pid = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
@@ -236,17 +299,22 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
 }
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: with `code >= 0` the hook is documented to receive a valid
+    // `CWPSTRUCT` in `lparam`. The hook unhooks itself before this module
+    // could be unloaded.
     unsafe {
         if code >= 0 {
             let msg = &*(lparam.0 as *const CWPSTRUCT);
             if msg.message == WM_APP_REMOTECALL {
                 let hwnd = msg.hwnd;
                 let force_iconic = BOOL::from(true);
-                let attr_ptr = &force_iconic as *const _ as *const _;
+                let attr_ptr = &raw const force_iconic as *const _;
 
                 let _ = DwmSetWindowAttribute(hwnd, DWMWA_FORCE_ICONIC_REPRESENTATION, attr_ptr, 4);
                 let _ = DwmSetWindowAttribute(hwnd, DWMWA_HAS_ICONIC_BITMAP, attr_ptr, 4);
-                let _ = SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0);
+                if !SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0).as_bool() {
+                    tracing::warn!("thumbnail_subclass_failed");
+                }
 
                 let hook = HOOK_HANDLE.swap(0, Ordering::Relaxed);
                 if hook != 0 {
@@ -266,19 +334,56 @@ unsafe extern "system" fn subclass_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    // SAFETY: Windows calls the subclass with a live window handle and the
+    // message parameters for `msg`; unwritten messages fall through to
+    // `DefSubclassProc`.
     unsafe {
-        match msg {
-            WM_DWMSENDICONICTHUMBNAIL | WM_DWMSENDICONICLIVEPREVIEWBITMAP => {
-                handle_iconic_request(hwnd, msg, lparam)
-            }
-            _ => {
-                if super::taskbar::handle_window_message(hwnd, msg, wparam, lparam) {
-                    LRESULT(0)
-                } else {
-                    DefSubclassProc(hwnd, msg, wparam, lparam)
-                }
-            }
+        if msg == WM_DWMSENDICONICTHUMBNAIL || msg == WM_DWMSENDICONICLIVEPREVIEWBITMAP {
+            return match iconic_request_size(hwnd, msg, lparam) {
+                Some((tw, th)) => handle_iconic_request(hwnd, msg, tw, th),
+                None => DefSubclassProc(hwnd, msg, wparam, lparam),
+            };
         }
+        if super::taskbar::handle_window_message(hwnd, msg, wparam, lparam) {
+            LRESULT(0)
+        } else {
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+    }
+}
+
+/// Bitmap size DWM asked for, clamped so a full-window live preview doesn't
+/// stall the platform thread with a one-off synchronous decode. DWM scales
+/// whatever it gets to the requested box.
+///
+/// # Safety
+/// `hwnd` must be a live window of this process, called on its owning thread.
+unsafe fn iconic_request_size(hwnd: HWND, msg: u32, lparam: LPARAM) -> Option<(u32, u32)> {
+    // SAFETY: inherited from the caller (`subclass_proc`).
+    unsafe {
+        let (w, h) = if msg == WM_DWMSENDICONICTHUMBNAIL {
+            // Documented packing: width in HIWORD, height in LOWORD.
+            let lp = lparam.0 as u32;
+            (lp >> 16, lp & 0xFFFF)
+        } else {
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            (
+                u32::try_from(rc.right - rc.left).ok()?,
+                u32::try_from(rc.bottom - rc.top).ok()?,
+            )
+        };
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let k = 512.0 / w.max(h) as f32;
+        if k >= 1.0 {
+            return Some((w, h));
+        }
+        Some((
+            ((w as f32 * k) as u32).max(1),
+            ((h as f32 * k) as u32).max(1),
+        ))
     }
 }
 
@@ -287,45 +392,28 @@ unsafe extern "system" fn subclass_proc(
 /// Steady state: the background prerender thread has already built a bitmap
 /// for this size, so this only swaps a pointer. First-ever request for a size
 /// still decodes synchronously (once), then caches.
-unsafe fn handle_iconic_request(hwnd: HWND, msg: u32, lparam: LPARAM) -> LRESULT {
-    unsafe {
-        let (tw, th) = match msg {
-            WM_DWMSENDICONICTHUMBNAIL => ((lparam.0 >> 16) as u32, (lparam.0 & 0xFFFF) as u32),
-            WM_DWMSENDICONICLIVEPREVIEWBITMAP => {
-                let mut rc = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rc);
-                ((rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32)
-            }
-            _ => return DefSubclassProc(hwnd, msg, WPARAM(0), lparam),
-        };
+fn handle_iconic_request(hwnd: HWND, msg: u32, tw: u32, th: u32) -> LRESULT {
+    record_requested_size(tw, th);
 
-        if tw == 0 || th == 0 {
-            return DefSubclassProc(hwnd, msg, WPARAM(0), lparam);
-        }
-
-        record_requested_size(tw, th);
-
-        let mut ready = READY_BITMAPS.lock();
-        // The lock is held across the DWM call: the prerender thread takes the
-        // same lock to replace bitmaps, so an evicted HBITMAP can't be deleted
-        // while DWM is still reading it.
-        if let Some(cached) = ready.iter().find(|c| c.width == tw && c.height == th) {
-            set_iconic_bitmap(hwnd, msg, HBITMAP(cached.hbitmap_ptr as *mut _));
-            return LRESULT(0);
-        }
-
-        let bytes = LAST_COVER.lock().as_ref().map(|c| c.bytes.clone());
-        if let Some(bytes) = bytes
-            && let Some(h) = create_hbitmap_from_wic(&bytes, tw, th)
-        {
-            replace_ready_bitmap(&mut ready, tw, th, h);
-            set_iconic_bitmap(hwnd, msg, h);
-        }
-
-        // Without a bitmap DWM keeps showing its default loading glass and
-        // re-requests later; returning 0 is the documented behavior.
-        LRESULT(0)
+    let mut ready = READY_BITMAPS.lock();
+    // Held across the DWM call so the prerender thread can't evict and
+    // `DeleteObject` this HBITMAP while `DwmSetIconic*` is using it.
+    if let Some(cached) = ready.iter().find(|c| c.width == tw && c.height == th) {
+        set_iconic_bitmap(hwnd, msg, HBITMAP(cached.hbitmap_ptr as *mut _));
+        return LRESULT(0);
     }
+
+    let bytes = LAST_COVER.lock().as_ref().map(|c| c.bytes.clone());
+    if let Some(bytes) = bytes
+        && let Some(h) = create_hbitmap_from_wic(&bytes, tw, th)
+    {
+        replace_ready_bitmap(&mut ready, tw, th, h);
+        set_iconic_bitmap(hwnd, msg, h);
+    }
+
+    // Without a bitmap DWM keeps showing its default loading glass and
+    // re-requests later; returning 0 is the documented behavior.
+    LRESULT(0)
 }
 
 fn record_requested_size(tw: u32, th: u32) {
@@ -334,15 +422,9 @@ fn record_requested_size(tw: u32, th: u32) {
         return;
     }
     sizes.insert(0, (tw, th));
-    while sizes.len() > MAX_READY_BITMAPS {
-        sizes.pop();
-        let mut ready = READY_BITMAPS.lock();
-        if let Some(old) = ready.pop() {
-            unsafe {
-                let _ = DeleteObject(HBITMAP(old.hbitmap_ptr as *mut _).into());
-            }
-        }
-    }
+    // Keep only the sizes DWM currently asks for; `replace_ready_bitmap` drops
+    // the matching bitmap when it has to make room, so both stay in step.
+    sizes.truncate(MAX_READY_BITMAPS);
 }
 
 fn ensure_com() {
@@ -350,12 +432,19 @@ fn ensure_com() {
     // STA, so MTA init there fails with RPC_E_CHANGED_MODE and is ignored;
     // WIC objects are free-threaded either way. Skipping CoUninitialize is
     // intentional: it would tear down COM under threads we don't own.
+    // SAFETY: `CoInitializeEx` on an already-initialized thread just returns a
+    // mode error, which is expected here and ignored.
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
     }
 }
 
 fn create_hbitmap_from_wic(bytes: &[u8], target_w: u32, target_h: u32) -> Option<HBITMAP> {
+    // SAFETY: every WIC/DWM call below is a plain COM/Win32 call on objects this
+    // function created and still owns, made on the thread that ran `ensure_com`.
+    // `dest_ptr` is only written inside the bounds of the DIB section allocated
+    // for `target_w * target_h` 32-bit pixels, using offsets derived from `size`
+    // clamped to `min(target_w, target_h)`.
     unsafe {
         ensure_com();
         let factory = WIC_FACTORY.with(|f| {
@@ -373,8 +462,10 @@ fn create_hbitmap_from_wic(bytes: &[u8], target_w: u32, target_h: u32) -> Option
         let frame = decoder.GetFrame(0).ok()?;
 
         let size = target_w.min(target_h);
+        if size == 0 {
+            return None;
+        }
         let radius = (size as f32 * 0.12) as i32;
-        let r_f = radius as f32;
 
         let scaler = factory.CreateBitmapScaler().ok()?;
         scaler
@@ -390,6 +481,21 @@ fn create_hbitmap_from_wic(bytes: &[u8], target_w: u32, target_h: u32) -> Option
                 None,
                 0.0,
                 WICBitmapPaletteTypeCustom,
+            )
+            .ok()?;
+
+        let row_bytes = (size * 4) as usize;
+        let mut src = vec![0u8; row_bytes * size as usize];
+        converter
+            .CopyPixels(
+                &WICRect {
+                    X: 0,
+                    Y: 0,
+                    Width: size as i32,
+                    Height: size as i32,
+                },
+                row_bytes as u32,
+                &mut src,
             )
             .ok()?;
 
@@ -420,54 +526,23 @@ fn create_hbitmap_from_wic(bytes: &[u8], target_w: u32, target_h: u32) -> Option
             return None;
         }
 
-        let dest_ptr = bits_ptr as *mut u8;
+        let dest_ptr = bits_ptr.cast::<u8>();
         std::ptr::write_bytes(dest_ptr, 0, (target_w * target_h * 4) as usize);
 
         let (offset_x, offset_y) = ((target_w - size) / 2, (target_h - size) / 2);
-        let stride = size * 4;
-        let mut row_buf = vec![0u8; stride as usize];
 
         for y in 0..size {
-            let prc = WICRect {
-                X: 0,
-                Y: y as i32,
-                Width: size as i32,
-                Height: 1,
-            };
-            if converter.CopyPixels(&prc, stride, &mut row_buf).is_err() {
-                continue;
-            }
-
-            let dest_row_start = ((offset_y + y) * target_w * 4 + offset_x * 4) as usize;
-            let is_top = y < radius as u32;
-            let is_bottom = y >= size - radius as u32;
-
+            let dest_row_start = (((offset_y + y) * target_w + offset_x) * 4) as usize;
             for x in 0..size {
-                let mut a = row_buf[(x * 4 + 3) as usize];
-
-                if (is_top || is_bottom) && (x < radius as u32 || x >= size - radius as u32) {
-                    let cx = if x < radius as u32 {
-                        r_f
-                    } else {
-                        size as f32 - r_f - 1.0
-                    };
-                    let cy = if is_top { r_f } else { size as f32 - r_f - 1.0 };
-                    let dist = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
-
-                    if dist > r_f {
-                        a = 0;
-                    } else if dist > r_f - 1.0 {
-                        a = (a as f32 * (r_f - dist)) as u8;
-                    }
-                }
+                let si = y as usize * row_bytes + (x * 4) as usize;
+                let a = (src[si + 3] as f32 * corner_coverage(size, radius, x, y)) as u8;
 
                 if a > 0 {
                     let f = a as f32 / 255.0;
                     let di = dest_row_start + (x * 4) as usize;
-                    let si = (x * 4) as usize;
-                    *dest_ptr.add(di) = (row_buf[si] as f32 * f) as u8;
-                    *dest_ptr.add(di + 1) = (row_buf[si + 1] as f32 * f) as u8;
-                    *dest_ptr.add(di + 2) = (row_buf[si + 2] as f32 * f) as u8;
+                    *dest_ptr.add(di) = (src[si] as f32 * f) as u8;
+                    *dest_ptr.add(di + 1) = (src[si + 1] as f32 * f) as u8;
+                    *dest_ptr.add(di + 2) = (src[si + 2] as f32 * f) as u8;
                     *dest_ptr.add(di + 3) = a;
                 }
             }
@@ -477,22 +552,74 @@ fn create_hbitmap_from_wic(bytes: &[u8], target_w: u32, target_h: u32) -> Option
     }
 }
 
+/// Alpha multiplier (0..=1) for the rounded corner at `(x, y)` of a
+/// `size`×`size` square with corner `radius`.
+fn corner_coverage(size: u32, radius: i32, x: u32, y: u32) -> f32 {
+    let r = radius.max(0) as u32;
+    if r == 0 {
+        return 1.0;
+    }
+    let is_top = y < r;
+    let is_bottom = y >= size.saturating_sub(r);
+    let is_left = x < r;
+    let is_right = x >= size.saturating_sub(r);
+    if !((is_top || is_bottom) && (is_left || is_right)) {
+        return 1.0;
+    }
+
+    let r_f = r as f32;
+    let cx = if is_left {
+        r_f
+    } else {
+        size as f32 - r_f - 1.0
+    };
+    let cy = if is_top { r_f } else { size as f32 - r_f - 1.0 };
+    let dist = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+
+    if dist > r_f {
+        0.0
+    } else if dist > r_f - 1.0 {
+        r_f - dist
+    } else {
+        1.0
+    }
+}
+
 fn cover_hash(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
         hash ^= b as u64;
-        hash = hash.wrapping_mul(0x1_0000_0001_b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
 }
 
-#[cfg(not(target_os = "windows"))]
-#[derive(Clone, Copy)]
-pub struct ThumbnailManager;
-#[cfg(not(target_os = "windows"))]
-impl ThumbnailManager {
-    pub fn new(_h: *mut std::ffi::c_void) -> Option<Self> {
-        Some(Self)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corners_are_transparent_and_the_middle_is_opaque() {
+        let (size, radius) = (100, 12);
+        assert_eq!(corner_coverage(size, radius, 0, 0), 0.0);
+        assert_eq!(corner_coverage(size, radius, size - 1, size - 1), 0.0);
+        assert_eq!(corner_coverage(size, radius, size / 2, size / 2), 1.0);
+        // First pixel past the corner arc is fully opaque.
+        assert_eq!(
+            corner_coverage(size, radius, radius as u32, radius as u32),
+            1.0
+        );
     }
-    pub fn update_cover(&self, _b: Vec<u8>) {}
+
+    #[test]
+    fn zero_radius_keeps_every_pixel() {
+        assert_eq!(corner_coverage(100, 0, 0, 0), 1.0);
+        assert_eq!(corner_coverage(100, 0, 99, 99), 1.0);
+    }
+
+    #[test]
+    fn cover_hash_tracks_content() {
+        assert_eq!(cover_hash(b"cover"), cover_hash(b"cover"));
+        assert_ne!(cover_hash(b"cover"), cover_hash(b"coveR"));
+    }
 }

@@ -6,6 +6,7 @@ import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/features/core/theme/app_theme.dart';
 import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
+import 'package:yayma/src/features/core/views/widgets/morphing_play_button.dart';
 import 'package:yayma/src/features/core/views/widgets/track_elements.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 
@@ -37,7 +38,7 @@ class MiniPlateLayout {
   static double progressWidth(double plateWidth) => plateWidth - sideInset * 2;
 }
 
-/// Surface of the mini plate: background colour, opacity, blur and border.
+/// Surface of the mini plate: background colour, opacity and border.
 ///
 /// The plate and its collapsed copy have to look identical, so they share
 /// this: a difference here shows up as the copy turning into a slightly
@@ -135,31 +136,11 @@ class MiniPlayPauseButton extends StatelessWidget {
       builder: (context) {
         final isPlaying = isPlayingSignal();
         final showBuffering = showBufferingIndicatorSignal.value;
-        return IconButton(
-          iconSize: 48,
-          icon: showBuffering
-              ? M3ECircularWavyProgressIndicator(
-                  strokeWidth: 3,
-                  size: 40,
-                  color: accentColorSignal.value,
-                )
-              : AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 250),
-                  switchInCurve: Curves.easeOutBack,
-                  switchOutCurve: Curves.easeIn,
-                  transitionBuilder: (child, animation) {
-                    return FadeTransition(
-                      opacity: animation,
-                      child: ScaleTransition(scale: animation, child: child),
-                    );
-                  },
-                  child: Icon(
-                    isPlaying
-                        ? Icons.pause_circle_filled_rounded
-                        : Icons.play_circle_filled_rounded,
-                    key: ValueKey<bool>(isPlaying),
-                  ),
-                ),
+        return MorphingPlayPauseButton(
+          isPlaying: isPlaying,
+          isBuffering: showBuffering,
+          size: 48,
+          color: accentColorSignal.value,
           onPressed: PlaybackController.togglePlay,
         );
       },

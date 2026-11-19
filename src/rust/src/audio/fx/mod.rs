@@ -25,6 +25,13 @@ pub trait Effect: Send + 'static {
     fn process(&mut self, left: &mut [f32], right: &mut [f32]);
 
     fn reset(&mut self);
+
+    /// Position-aware seek. Buffer-based effects keep the default clear-on-seek
+    /// semantics; position-tracking effects (fade) override this so their
+    /// timeline stays anchored to absolute track time.
+    fn seek(&mut self, _pos: Duration, _sample_rate: u32) {
+        self.reset();
+    }
 }
 
 /// A source that can produce samples block-wise.
@@ -218,12 +225,7 @@ mod tests {
         let mut fx = FxSource::new(VecSource::new(vec![1.0; 600]));
         let params = Arc::new(param::EffectParams::new(&[]));
         params.set_enabled(true);
-        fx.add_effect(
-            "gain",
-            "Gain",
-            Box::new(GainEffect { gain: 0.5 }),
-            params,
-        );
+        fx.add_effect("gain", "Gain", Box::new(GainEffect { gain: 0.5 }), params);
 
         let drained: Vec<f32> = std::iter::from_fn(|| fx.next()).collect();
         assert_eq!(drained.len(), 600);

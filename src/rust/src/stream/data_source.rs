@@ -14,6 +14,20 @@ use super::buffering::BufferingGate;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Why a stream source could not be opened.
+///
+/// The distinction matters upstream: a URL the server rejected is dead and must
+/// leave the cache, while a transport failure must keep it for the next attempt.
+#[derive(Debug, thiserror::Error)]
+pub enum StreamSourceError {
+    /// The server answered but refused to serve the stream.
+    #[error("stream url rejected (status {0})")]
+    Rejected(u16),
+    /// Transport, parsing or timeout failure: retrying the same URL may work.
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
 type FetchFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -28,6 +42,17 @@ const MIN_INITIAL_DATA: usize = 512 * 1024;
 const MAX_ATTEMPTS: usize = 20; // 10 seconds total while waiting for a range
 const RANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RANGE_RETRIES: usize = 3;
+/// Body-read floor: a range request is allowed at least this transfer rate.
+/// Slower-but-flowing links would turn every large prefetch into a timeout
+/// under a fixed cap, starving playback exactly when it needs the buffer.
+const RANGE_BODY_BYTES_PER_MS: u64 = 64; // 64 KB/s
+
+/// Deadline for reading one range body: the fixed connect/headers budget
+/// plus a size-proportional transfer budget. A dead peer is still caught by
+/// the client-level `read_timeout`; this only has to outlive a slow link.
+fn range_body_timeout(bytes: u64) -> Duration {
+    RANGE_TIMEOUT + Duration::from_millis(bytes / RANGE_BODY_BYTES_PER_MS)
+}
 
 enum FetchCommand {
     Fetch {
@@ -36,6 +61,19 @@ enum FetchCommand {
         generation: u64,
     },
     Shutdown,
+}
+
+/// Charges one retry when a fetch notification brought no new bytes; growth
+/// resets the budget so a slow but live fetch never times out. Returns `true`
+/// when the attempt budget is spent.
+fn account_wait(available: usize, last_available: &mut usize, attempts: &mut usize) -> bool {
+    if available > *last_available {
+        *attempts = 0;
+    } else {
+        *attempts += 1;
+    }
+    *last_available = available;
+    *attempts >= MAX_ATTEMPTS
 }
 
 pub struct StreamingDataSource {
@@ -58,7 +96,7 @@ impl StreamingDataSource {
         progress: Arc<TrackProgress>,
         buffering: Arc<BufferingGate>,
         duration_ms: Option<u64>,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, StreamSourceError> {
         let progress_generation = progress.get_generation();
 
         // 1. Fetch first chunk to get total content size
@@ -70,33 +108,27 @@ impl StreamingDataSource {
         let resp = Self::fetch_range_response(&client, &urls, 0, initial_size as u64)
             .await?
             .error_for_status()
-            .map_err(|e| {
-                Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                    "stream url rejected (status {}): {}",
-                    e.status().map(|s| s.as_u16()).unwrap_or(0),
-                    e
-                ))
+            .map_err(|e| match e.status() {
+                Some(status) => StreamSourceError::Rejected(status.as_u16()),
+                None => StreamSourceError::Other(e.into()),
             })?;
 
         let total = if let Some(range) = resp.headers().get("content-range") {
-            let s = range.to_str().map_err(|_| {
-                Box::<dyn std::error::Error + Send + Sync>::from("invalid content-range header")
-            })?;
+            let s = range
+                .to_str()
+                .map_err(|_| StreamSourceError::Other("invalid content-range header".into()))?;
             if let Some(slash) = s.find('/') {
                 s[slash + 1..].parse::<u64>().map_err(|_| {
-                    Box::<dyn std::error::Error + Send + Sync>::from(
-                        "invalid total size in content-range",
-                    )
+                    StreamSourceError::Other("invalid total size in content-range".into())
                 })?
             } else {
-                return Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                    "invalid content-range format",
+                return Err(StreamSourceError::Other(
+                    "invalid content-range format".into(),
                 ));
             }
         } else {
-            resp.content_length().ok_or_else(|| {
-                Box::<dyn std::error::Error + Send + Sync>::from("content-length missing")
-            })?
+            resp.content_length()
+                .ok_or_else(|| StreamSourceError::Other("content-length missing".into()))?
         };
 
         progress.set_total_bytes(total);
@@ -128,9 +160,13 @@ impl StreamingDataSource {
             (8 * 1024 * 1024, 256 * 1024, 1024 * 1024)
         };
 
-        let initial_data = tokio::time::timeout(RANGE_TIMEOUT, resp.bytes())
-            .await
-            .map_err(|_| "initial stream range body timed out")??;
+        let initial_data = tokio::time::timeout(
+            range_body_timeout(initial_size as u64),
+            resp.bytes(),
+        )
+        .await
+        .map_err(|_| StreamSourceError::Other("initial stream range body timed out".into()))?
+        .map_err(|e| StreamSourceError::Other(e.into()))?;
         let initial_data_len = initial_data.len();
 
         let buffer = Arc::new(Mutex::new(BufferState::new(
@@ -219,7 +255,10 @@ impl StreamingDataSource {
                         std::future::pending().await
                     }
                 }, if has_fetch => {
-                    let (_, start, _end, request_generation) = current_fetch.take().unwrap();
+                    let Some((_, start, _end, request_generation)) = current_fetch.take() else {
+                        // `has_fetch` was true when the branch was selected.
+                        continue;
+                    };
                     match res {
                         Ok(Ok(data)) => {
                             let current_gen = ctx.generation.load(Ordering::Acquire);
@@ -243,7 +282,7 @@ impl StreamingDataSource {
                             let _ = ctx.tx_res.send(());
                         }
                         Ok(Err(err)) => {
-                            tracing::error!("Stream fetch failed: {:?}", err);
+                            tracing::error!(error = ?err, "stream_fetch_failed");
                             {
                                 let mut buf = ctx.buffer.lock();
                                 buf.clear_pending();
@@ -301,8 +340,12 @@ impl StreamingDataSource {
     }
 
     fn fetch_range_timeout(client: Client, urls: Vec<String>, start: u64, end: u64) -> FetchFuture {
+        // The outer cap covers all retry attempts of one fetch; scaled with
+        // the body size so it never fires before a single slow attempt could
+        // have finished on its own.
+        let budget = range_body_timeout(end.saturating_sub(start)).saturating_mul(MAX_RANGE_RETRIES as u32);
         Box::pin(tokio::time::timeout(
-            RANGE_TIMEOUT * MAX_RANGE_RETRIES as u32,
+            budget,
             async move { Self::fetch_range_async(&client, &urls, start, end).await },
         ))
     }
@@ -312,7 +355,7 @@ impl StreamingDataSource {
         urls: &[String],
         start: u64,
         size: u64,
-    ) -> Result<reqwest::Response> {
+    ) -> std::result::Result<reqwest::Response, StreamSourceError> {
         let end = start.saturating_add(size);
         let mut last = None;
         for attempt in 0..MAX_RANGE_RETRIES {
@@ -332,19 +375,19 @@ impl StreamingDataSource {
                 Ok(Ok(resp)) if resp.status().is_success() || resp.status().is_redirection() => {
                     return Ok(resp);
                 }
-                Ok(Ok(resp)) => {
-                    last = Some(format!("stream url rejected (status {})", resp.status()))
+                Ok(Ok(resp)) => last = Some(StreamSourceError::Rejected(resp.status().as_u16())),
+                Ok(Err(err)) => last = Some(StreamSourceError::Other(err.into())),
+                Err(_) => {
+                    last = Some(StreamSourceError::Other(
+                        "stream range request timed out".into(),
+                    ));
                 }
-                Ok(Err(err)) => last = Some(err.to_string()),
-                Err(_) => last = Some("stream range request timed out".into()),
             }
             if attempt + 1 < MAX_RANGE_RETRIES {
                 tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
             }
         }
-        Err(last
-            .unwrap_or_else(|| "stream range request failed".into())
-            .into())
+        Err(last.unwrap_or_else(|| StreamSourceError::Other("stream range request failed".into())))
     }
 
     async fn fetch_range_async(
@@ -365,9 +408,7 @@ impl StreamingDataSource {
                     // Fail fast on client errors (e.g. 403 expired URL, 404):
                     // retrying other mirrors won't help and only adds latency.
                     // 408/429 are retryable.
-                    if status.is_client_error()
-                        && status.as_u16() != 408
-                        && status.as_u16() != 429
+                    if status.is_client_error() && status.as_u16() != 408 && status.as_u16() != 429
                     {
                         return Err(Box::from(format!(
                             "stream url rejected (status {})",
@@ -391,12 +432,15 @@ impl StreamingDataSource {
                                 {
                                     last_error = Some("invalid content-range unit".into());
                                 } else {
-                                    match tokio::time::timeout(RANGE_TIMEOUT, resp.bytes()).await {
+                                    match tokio::time::timeout(
+                                        range_body_timeout(end.saturating_sub(start)),
+                                        resp.bytes(),
+                                    )
+                                    .await
+                                    {
                                         Ok(Ok(bytes)) => {
                                             if bytes.is_empty() {
-                                                last_error = Some(
-                                                    "empty stream range body".into(),
-                                                );
+                                                last_error = Some("empty stream range body".into());
                                             } else {
                                                 return Ok(bytes);
                                             }
@@ -438,23 +482,27 @@ impl StreamingDataSource {
             .map_err(|_| Box::<dyn std::error::Error + Send + Sync>::from("fetch cmd failed"))
     }
 
-    fn wait_for(&self, pos: u64, min: usize) -> Result<()> {
-        // Near the tail the file simply has fewer than `min` bytes left, so waiting
-        // for `min` there would never be satisfied. `buf.eof` used to stand in for
-        // that, but it only means "the last byte of the file was fetched at some
-        // point" — with a hole at `pos` it reported success on an empty buffer, the
-        // caller then read 0 bytes, and symphonia took that for a clean end of
-        // stream and cut the track short.
+    /// Bytes that must be buffered at `pos` for `min` to be satisfiable, and
+    /// the amount already there. A slice near the tail simply has fewer than
+    /// `min` bytes left, so waiting for `min` there would never be satisfied.
+    fn wait_target(&self, pos: u64, min: usize) -> (usize, usize) {
         let needed = min.min(self.total_bytes.saturating_sub(pos) as usize);
+        let available = self.buffer.lock().available_from(pos);
+        (needed, available)
+    }
 
-        let mut last_available = {
-            let buf = self.buffer.lock();
-            let available = buf.available_from(pos);
-            if available >= needed {
-                return Ok(());
-            }
-            available
-        };
+    /// Blocks (on the decode thread) until `min` bytes are buffered at `pos`.
+    ///
+    /// The async counterpart below serves `new`. The loops stay separate because
+    /// one waits on a crossbeam channel and the other on tokio, but the byte
+    /// budget and the retry accounting are shared: a notification that did not
+    /// grow the buffer burns an attempt, so a transient failure cannot silently
+    /// double the wait.
+    fn wait_for(&self, pos: u64, min: usize) -> Result<()> {
+        let (needed, mut last_available) = self.wait_target(pos, min);
+        if last_available >= needed {
+            return Ok(());
+        }
 
         self.buffering.set(true);
 
@@ -462,25 +510,15 @@ impl StreamingDataSource {
         let mut result = Ok(());
 
         while attempts < MAX_ATTEMPTS {
-            // Wait for next fetch completion with a longer timeout
             match self.fetch_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(_) => {
-                    let buf = self.buffer.lock();
-                    let available = buf.available_from(pos);
+                    let available = self.buffer.lock().available_from(pos);
                     if available >= needed {
                         break;
                     }
-                    // Only reset the retry budget if this notification actually made
-                    // progress. fetch_loop_async also notifies on a failed/empty fetch
-                    // (after buf.clear_pending()), so a bare "we got *a* notification"
-                    // check let a single transient failure reset the clock right before
-                    // timeout and silently double the wait for one hiccup.
-                    if available > last_available {
-                        attempts = 0;
-                    } else {
-                        attempts += 1;
+                    if account_wait(available, &mut last_available, &mut attempts) {
+                        break;
                     }
-                    last_available = available;
                 }
                 Err(flume::RecvTimeoutError::Timeout) => {
                     attempts += 1;
@@ -497,21 +535,14 @@ impl StreamingDataSource {
         }
 
         self.buffering.set(false);
-
         result
     }
 
     async fn wait_for_async(&self, pos: u64, min: usize) -> Result<()> {
-        let needed = min.min(self.total_bytes.saturating_sub(pos) as usize);
-
-        let mut last_available = {
-            let buf = self.buffer.lock();
-            let available = buf.available_from(pos);
-            if available >= needed {
-                return Ok(());
-            }
-            available
-        };
+        let (needed, mut last_available) = self.wait_target(pos, min);
+        if last_available >= needed {
+            return Ok(());
+        }
 
         self.buffering.set(true);
 
@@ -522,18 +553,13 @@ impl StreamingDataSource {
             match tokio::time::timeout(Duration::from_millis(500), self.fetch_rx.recv_async()).await
             {
                 Ok(Ok(_)) => {
-                    let buf = self.buffer.lock();
-                    let available = buf.available_from(pos);
+                    let available = self.buffer.lock().available_from(pos);
                     if available >= needed {
                         break;
                     }
-
-                    if available > last_available {
-                        attempts = 0;
-                    } else {
-                        attempts += 1;
+                    if account_wait(available, &mut last_available, &mut attempts) {
+                        break;
                     }
-                    last_available = available;
                 }
                 Ok(Err(_)) => {
                     result = Err("fetch channel closed".into());
@@ -719,5 +745,48 @@ impl Drop for StreamingDataSource {
         if let Some(handle) = self.task_handle.take() {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_body_timeout_scales_with_size_and_keeps_a_floor() {
+        // Headers/connect keep the fixed budget even for an empty body.
+        assert_eq!(range_body_timeout(0), RANGE_TIMEOUT);
+        // ~64 KB/s floor: 512 KB buys ~8 extra seconds, 4 MB over a minute,
+        // so a slow-but-flowing link can deliver a large prefetch.
+        assert_eq!(
+            range_body_timeout(512 * 1024),
+            RANGE_TIMEOUT + Duration::from_millis(8192)
+        );
+        assert!(range_body_timeout(4 * 1024 * 1024) > RANGE_TIMEOUT * 3);
+    }
+
+    #[test]
+    fn wait_budget_resets_while_bytes_arrive() {
+        let (mut last, mut attempts) = (0usize, MAX_ATTEMPTS - 1);
+
+        assert!(
+            !account_wait(64, &mut last, &mut attempts),
+            "growth must reset the budget"
+        );
+        assert_eq!(attempts, 0);
+        assert_eq!(last, 64);
+    }
+
+    #[test]
+    fn wait_budget_runs_out_without_progress() {
+        let (mut last, mut attempts) = (64usize, 0);
+
+        for _ in 0..MAX_ATTEMPTS - 1 {
+            assert!(!account_wait(64, &mut last, &mut attempts));
+        }
+        assert!(
+            account_wait(64, &mut last, &mut attempts),
+            "stalled fetches must time out"
+        );
     }
 }

@@ -20,6 +20,7 @@ import 'package:yayma/src/features/core/views/widgets/track_context_sheet.dart';
 import 'package:yayma/src/features/core/views/widgets/track_tile.dart';
 import 'package:yayma/src/features/library/providers/library_provider.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
+import 'package:yayma/src/features/playback/providers/wave_provider.dart';
 import 'package:yayma/src/rust/api/content.dart' as rust;
 import 'package:yayma/src/rust/api/models.dart';
 
@@ -118,7 +119,12 @@ class _PlaylistViewState extends State<PlaylistView> {
         }
 
         if (state.hasError && meta == null) {
-          return Center(child: CommonErrorWidget(error: state.error!));
+          return Center(
+            child: CommonErrorWidget(
+              error: state.error!,
+              onRetry: requestGlobalRefresh,
+            ),
+          );
         }
 
         if (meta == null) {
@@ -206,6 +212,10 @@ class _PlaylistContentState extends State<_PlaylistContent> {
 
   Future<void> _handlePlaylistAction(String value) async {
     switch (value) {
+      case 'wave':
+        await WaveController.playStation(
+          'playlist:${widget.playlist.uid}:${widget.playlist.kind}',
+        );
       case 'rename':
         await _showRenameDialog(context, widget.playlist);
       case 'visibility':
@@ -225,6 +235,11 @@ class _PlaylistContentState extends State<_PlaylistContent> {
       context,
       title: 'Плейлист',
       actionsBuilder: () => [
+        const TrackSheetAction(
+          value: 'wave',
+          label: 'Моя волна по плейлисту',
+          icon: Icons.waves_rounded,
+        ),
         const TrackSheetAction(
           value: 'rename',
           label: 'Переименовать',
@@ -313,13 +328,18 @@ class _PlaylistContentState extends State<_PlaylistContent> {
                   Icons.more_vert_rounded,
                   color: cs.onSurfaceVariant,
                   size: 32,
+                  semanticLabel: 'Опции плейлиста',
                 ),
                 onPressed: _showPlaylistSheet,
-                tooltip: 'Опции плейлиста',
               )
             : AppContextMenu<String>(
                 onSelected: (value) => unawaited(_handlePlaylistAction(value)),
                 items: [
+                  const AppContextMenuItem(
+                    value: 'wave',
+                    label: 'Моя волна по плейлисту',
+                    icon: Icons.waves_rounded,
+                  ),
                   const AppContextMenuItem(
                     value: 'rename',
                     label: 'Переименовать',
@@ -346,9 +366,9 @@ class _PlaylistContentState extends State<_PlaylistContent> {
                     Icons.more_vert_rounded,
                     color: cs.onSurfaceVariant,
                     size: 32,
+                    semanticLabel: 'Опции плейлиста',
                   ),
                   onPressed: null,
-                  tooltip: 'Опции плейлиста',
                 ),
               ),
         actions: isAndroid
@@ -361,8 +381,10 @@ class _PlaylistContentState extends State<_PlaylistContent> {
                         widget.playlist.uid.toString(),
                         widget.playlist.kind,
                       ),
-                      tooltip: 'Слушать',
-                      icon: const Icon(Icons.play_arrow_rounded),
+                      icon: const Icon(
+                        Icons.play_arrow_rounded,
+                        semanticLabel: 'Слушать',
+                      ),
                       style: IconButton.styleFrom(
                         minimumSize: const Size(64, 56),
                         iconSize: 26,
@@ -374,8 +396,10 @@ class _PlaylistContentState extends State<_PlaylistContent> {
                     const SizedBox(width: 8),
                     IconButton(
                       onPressed: () => _handleUpload(context),
-                      tooltip: 'Загрузить трек',
-                      icon: const Icon(Icons.upload_rounded),
+                      icon: const Icon(
+                        Icons.upload_rounded,
+                        semanticLabel: 'Загрузить трек',
+                      ),
                       style: IconButton.styleFrom(
                         minimumSize: const Size(64, 56),
                         iconSize: 26,
@@ -588,7 +612,7 @@ class _PlaylistContentState extends State<_PlaylistContent> {
           ),
           actions: [
             AppDialog.cancelButton(context),
-            M3EElevatedButton(
+            M3ETextButton(
               onPressed: () async {
                 await deletePlaylistAction(playlist.kind);
                 if (context.mounted) {
@@ -596,10 +620,10 @@ class _PlaylistContentState extends State<_PlaylistContent> {
                   setSection(AppSection.liked);
                 }
               },
-              decoration: M3EButtonDecoration.styleFrom(
-                backgroundColor: cs.error,
+              child: Text(
+                'Удалить',
+                style: TextStyle(color: cs.error, fontWeight: FontWeight.w700),
               ),
-              child: const Text('Удалить'),
             ),
           ],
         );
@@ -656,9 +680,12 @@ class _TrackTile extends StatelessWidget {
       ),
       hoverActions: [
         IconButton(
-          icon: Icon(Icons.playlist_remove_rounded, color: cs.error),
+          icon: Icon(
+            Icons.playlist_remove_rounded,
+            color: cs.error,
+            semanticLabel: 'Удалить из плейлиста',
+          ),
           onPressed: onRemove,
-          tooltip: 'Удалить из плейлиста',
         ),
       ],
       onTap: () => PlaybackController.playPlaylistTrack(

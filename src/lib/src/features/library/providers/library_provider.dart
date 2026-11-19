@@ -146,7 +146,10 @@ Future<void> disposeLibrary() async {
   _librarySearchDebouncer.dispose();
   final sub = _likedSub;
   _likedSub = null;
-  await sub?.cancel();
+  // Never await: an FFI stream cancel may never complete, which used to stall
+  // logout before it could show the login screen. Late chunks are dropped by
+  // the `sub != _likedSub` guards.
+  unawaited(sub?.cancel());
   _resetLikedAccum();
   likedTracksSignal.value = [];
   playlistsSignal.value = [];
@@ -620,6 +623,8 @@ Future<bool> removeTrackFromPlaylistAction(
     // Keep the cached checkmarks in sync with the removal.
     _updateTrackMembership(trackId, kind, present: false);
     await refreshPlaylists();
+  } else {
+    showAppError('Не удалось удалить трек из плейлиста');
   }
   return success;
 }
@@ -641,7 +646,11 @@ Future<bool> moveTrackInPlaylistAction(
       albumId: albumId ?? '',
     ),
   );
-  if (success) await refreshPlaylists();
+  if (success) {
+    await refreshPlaylists();
+  } else {
+    showAppError('Не удалось переместить трек в плейлисте');
+  }
   return success;
 }
 
@@ -749,18 +758,20 @@ Future<List<String>> downloadCollectionToFilesAction(
 }
 
 Future<int> deleteAllLikedTracksAction(List<SimpleTrackDto> tracks) async {
-  final ctx = appContextSignal.value;
-  if (ctx == null) return 0;
+  final downloaded = downloadedTracksSignal.value;
+  final ids = tracks
+      .where((track) => downloaded.contains(track.id))
+      .map((track) => track.id)
+      .toList();
+  if (ids.isEmpty) return 0;
 
-  var deleted = 0;
-  final downloadedTracks = downloadedTracksSignal.value;
-  for (final track in tracks) {
-    if (downloadedTracks.contains(track.id)) {
-      await deleteDownloadedTrack(ctx: ctx, trackId: track.id);
-      deleted++;
-    }
-  }
-  // Single refresh after the loop: per-track refreshes used to queue
+  // One FFI call for the whole batch instead of a round trip per track.
+  final deleted =
+      await runRustFetch(
+        (ctx) => deleteDownloadedTracks(ctx: ctx, trackIds: ids),
+      ) ??
+      0;
+  // Single refresh after the batch: per-track refreshes used to queue
   // thousands of redundant DB reads on large libraries.
   if (deleted > 0) unawaited(refreshDownloadedTracks());
 

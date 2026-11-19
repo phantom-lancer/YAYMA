@@ -9,22 +9,25 @@ use windows::{
     Win32::Foundation::{HMODULE, HWND, LPARAM, WPARAM},
     Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
     Win32::System::LibraryLoader::GetModuleFileNameW,
-    Win32::UI::Controls::{HIMAGELIST, ILC_COLOR32, ILC_MASK, ImageList_Create, ImageList_ReplaceIcon},
+    Win32::UI::Controls::{
+        HIMAGELIST, ILC_COLOR32, ILC_MASK, ImageList_Create, ImageList_ReplaceIcon,
+    },
     Win32::UI::Shell::{
-        ITaskbarList3, THB_BITMAP, THB_FLAGS, THB_TOOLTIP, THBF_ENABLED, THBF_HIDDEN,
-        THUMBBUTTON, THUMBBUTTONFLAGS, THUMBBUTTONMASK, TaskbarList,
+        ITaskbarList3, THB_BITMAP, THB_FLAGS, THB_TOOLTIP, THBF_ENABLED, THBF_HIDDEN, THUMBBUTTON,
+        THUMBBUTTONFLAGS, THUMBBUTTONMASK, TaskbarList,
     },
     Win32::UI::WindowsAndMessaging::{
-        HICON, IMAGE_ICON, LR_LOADFROMFILE, LR_LOADTRANSPARENT, LoadImageW, SM_CXSMICON,
-        SM_CYSMICON, WM_COMMAND, GetSystemMetrics, IsWindowVisible, PostMessageW,
+        GetSystemMetrics, HICON, IMAGE_ICON, IsWindowVisible, LR_LOADFROMFILE, LR_LOADTRANSPARENT,
+        LoadImageW, PostMessageW, SM_CXSMICON, SM_CYSMICON, WM_COMMAND,
     },
     core::{HSTRING, PCWSTR},
 };
 
-/// ITaskbarList3 must live on the STA platform thread; the UI-state below is
-/// only ever touched from messages dispatched there.
-struct ComSend<T>(T);
-unsafe impl<T> Send for ComSend<T> {}
+/// `ITaskbarList3` lives on and is used only from the STA platform thread; the
+/// wrapper lets it sit in a `static` without making every COM type `Send`.
+struct ComSend(ITaskbarList3);
+// SAFETY: only the window subclass proc, which runs on that thread, touches it.
+unsafe impl Send for ComSend {}
 
 const BUTTON_COUNT: usize = 7;
 const FIRST_BUTTON_ID: u32 = 40001;
@@ -43,7 +46,7 @@ enum UiCmd {
 }
 
 struct UiState {
-    taskbar: Option<ComSend<ITaskbarList3>>,
+    taskbar: Option<ComSend>,
     // Raw GDI handles stored as isize: HICON/HIMAGELIST are plain pointers
     // and not Send, while the state lives in a static shared across threads.
     image_list: Option<isize>,
@@ -78,6 +81,11 @@ impl UiState {
 
 static UI_STATE: LazyLock<Mutex<UiState>> = LazyLock::new(|| Mutex::new(UiState::default()));
 
+/// Command waiting for the platform thread. The poster writes it here and then
+/// posts a bare `WM_APP_TASKBAR`, so no pointer travels through `LPARAM` and a
+/// stray message can't be turned into a bogus dereference.
+static PENDING_CMD: Mutex<Option<UiCmd>> = Mutex::new(None);
+
 static CTX: RwLock<Option<AppContext>> = RwLock::new(None);
 static RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 static MAIN_HWND: OnceLock<isize> = OnceLock::new();
@@ -100,7 +108,13 @@ pub fn init(ctx: AppContext, mut shutdown_rx: watch::Receiver<bool>) {
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
+                    if *shutdown_rx.borrow() {
+                        // Drop the eternal context clone so the old stack is
+                        // not pinned alive; the subclass no-ops button
+                        // presses until the next login rewrites it.
+                        *CTX.write() = None;
+                        break;
+                    }
                 }
                 res = changed_rx.changed() => {
                     if res.is_err() { break; }
@@ -129,12 +143,13 @@ pub fn init(ctx: AppContext, mut shutdown_rx: watch::Receiver<bool>) {
 /// Called from the window subclass (platform thread). Returns true for
 /// messages consumed here; everything else must fall through to
 /// `DefSubclassProc` (tray menus, other plugins also send `WM_COMMAND`).
-pub(crate) fn handle_window_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
+pub(crate) fn handle_window_message(hwnd: HWND, msg: u32, wparam: WPARAM, _lparam: LPARAM) -> bool {
     if msg == WM_APP_TASKBAR {
-        let cmd = unsafe { Box::from_raw(lparam.0 as *mut UiCmd) };
-        match *cmd {
-            UiCmd::SetButtons { buttons, tooltip } => {
-                apply_buttons(hwnd, buttons, tooltip);
+        if let Some(cmd) = PENDING_CMD.lock().take() {
+            match cmd {
+                UiCmd::SetButtons { buttons, tooltip } => {
+                    apply_buttons(hwnd, &buttons, &tooltip);
+                }
             }
         }
         return true;
@@ -198,7 +213,12 @@ async fn send_update(ctx: &AppContext) {
         },
         ButtonSpec {
             icon: icon(if disliked { "disliked" } else { "dislike" }),
-            tooltip: if disliked { "Убрать дизлайк" } else { "Дизлайк" }.into(),
+            tooltip: if disliked {
+                "Убрать дизлайк"
+            } else {
+                "Дизлайк"
+            }
+            .into(),
         },
         ButtonSpec {
             icon: icon("skip_previous"),
@@ -206,7 +226,12 @@ async fn send_update(ctx: &AppContext) {
         },
         ButtonSpec {
             icon: icon(if is_playing { "pause" } else { "play" }),
-            tooltip: if is_playing { "Пауза" } else { "Играть" }.into(),
+            tooltip: if is_playing {
+                "Пауза"
+            } else {
+                "Играть"
+            }
+            .into(),
         },
         ButtonSpec {
             icon: icon("skip_next"),
@@ -214,7 +239,12 @@ async fn send_update(ctx: &AppContext) {
         },
         ButtonSpec {
             icon: icon(if liked { "liked" } else { "like" }),
-            tooltip: if liked { "Убрать лайк" } else { "Лайк" }.into(),
+            tooltip: if liked {
+                "Убрать лайк"
+            } else {
+                "Лайк"
+            }
+            .into(),
         },
         ButtonSpec {
             icon: icon(match repeat_mode {
@@ -249,22 +279,27 @@ fn dispatch_on_ui_thread(cmd: UiCmd) {
     let Some(hwnd) = MAIN_HWND.get().copied() else {
         return;
     };
-    let ptr = Box::into_raw(Box::new(cmd));
+    *PENDING_CMD.lock() = Some(cmd);
+    // SAFETY: `MAIN_HWND` only ever stores the handle of this process's main
+    // window; posting to a since-destroyed handle merely fails, and the command
+    // is dropped below in that case.
     let posted = unsafe {
         PostMessageW(
             Some(HWND(hwnd as *mut _)),
             WM_APP_TASKBAR,
             WPARAM(0),
-            LPARAM(ptr as isize),
+            LPARAM(0),
         )
     };
     if posted.is_err() {
-        // Window is gone; free the command instead of leaking it.
-        drop(unsafe { Box::from_raw(ptr) });
+        // Window is gone; drop the command instead of applying it later.
+        PENDING_CMD.lock().take();
     }
 }
 
-fn apply_buttons(hwnd: HWND, buttons: Vec<ButtonSpec>, tooltip: String) {
+fn apply_buttons(hwnd: HWND, buttons: &[ButtonSpec], tooltip: &str) {
+    // SAFETY: called from the window's own subclass proc, so `hwnd` is live and
+    // every taskbar/ITaskbarList3 call happens on its owning (UI) thread.
     unsafe {
         if !IsWindowVisible(hwnd).as_bool() {
             // Hidden (e.g. closed to tray): skip now, the watcher retries on
@@ -335,27 +370,27 @@ fn apply_buttons(hwnd: HWND, buttons: Vec<ButtonSpec>, tooltip: String) {
             dwFlags: THUMBBUTTONFLAGS(0),
         });
 
-        for i in 0..BUTTON_COUNT {
+        for (i, button) in thumb_buttons.iter_mut().enumerate() {
             let id = FIRST_BUTTON_ID + i as u32;
-            if let Some(spec) = buttons.get(i) {
-                thumb_buttons[i] = THUMBBUTTON {
+            *button = if let Some(spec) = buttons.get(i) {
+                THUMBBUTTON {
                     dwMask: THUMBBUTTONMASK(THB_BITMAP.0 | THB_TOOLTIP.0 | THB_FLAGS.0),
                     iId: id,
                     iBitmap: i as u32,
                     hIcon: HICON::default(),
                     szTip: utf16(spec.tooltip.as_str()),
                     dwFlags: THBF_ENABLED,
-                };
+                }
             } else {
-                thumb_buttons[i] = THUMBBUTTON {
+                THUMBBUTTON {
                     dwMask: THUMBBUTTONMASK(THB_FLAGS.0),
                     iId: id,
                     iBitmap: 0,
                     hIcon: HICON::default(),
                     szTip: [0; 260],
                     dwFlags: THBF_HIDDEN,
-                };
-            }
+                }
+            };
         }
 
         let result = if state.buttons_added {
@@ -371,7 +406,7 @@ fn apply_buttons(hwnd: HWND, buttons: Vec<ButtonSpec>, tooltip: String) {
             return;
         }
 
-        let tip = HSTRING::from(tooltip.as_str());
+        let tip = HSTRING::from(tooltip);
         let _ = taskbar.SetThumbnailTooltip(hwnd, PCWSTR(tip.as_ptr()));
     }
 }
@@ -391,6 +426,8 @@ fn cached_icon(
     wide.push(0);
 
     let handle = unsafe {
+        // SAFETY: `wide` is NUL-terminated (pushed above) and outlives the call;
+        // `cx`/`cy` are caller-supplied icon dimensions, which is all the API needs.
         LoadImageW(
             None,
             PCWSTR(wide.as_ptr()),
@@ -412,6 +449,9 @@ fn resolve_asset(asset: &str) -> Option<std::path::PathBuf> {
     static ASSETS_DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     let dir = ASSETS_DIR.get_or_init(|| {
         let mut buf = [0u16; 1024];
+        // SAFETY: writes at most `buf.len()` UTF-16 units into a stack buffer that
+        // outlives the call; a truncated path is handled by the `len == 0` guard
+        // and `from_utf16_lossy`.
         let len = unsafe { GetModuleFileNameW(Some(HMODULE::default()), &mut buf) } as usize;
         if len == 0 {
             return None;
@@ -473,7 +513,7 @@ mod cover {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for b in s.as_bytes() {
             hash ^= *b as u64;
-            hash = hash.wrapping_mul(0x1_0000_0001_b3);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
         hash
     }
