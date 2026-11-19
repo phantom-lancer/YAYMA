@@ -9,6 +9,11 @@ pub struct AppUpdateInfoDto {
 fn is_newer_version(current: &str, latest: &str) -> bool {
     let clean = |v: &str| -> String {
         let mut cleaned = v.trim().to_lowercase();
+        // Android releases in the personal fork use an isolated tag prefix
+        // so they never trigger the desktop multi-platform publisher.
+        if let Some(version) = cleaned.strip_prefix("android-") {
+            cleaned = version.to_string();
+        }
         if cleaned.starts_with('v') {
             cleaned.remove(0);
         }
@@ -53,8 +58,19 @@ pub async fn check_for_updates() -> Option<AppUpdateInfoDto> {
         }
     };
 
+    // Keep desktop builds on the upstream release channel. Android builds
+    // must follow the user's fork, otherwise the next upstream APK would
+    // replace the custom Android UI and features.
+    let repository = if cfg!(target_os = "android") {
+        "phantom-lancer/YAYMA"
+    } else {
+        "DarkPlayOff/YAYMA"
+    };
+    let releases_url = format!(
+        "https://api.github.com/repos/{repository}/releases/latest"
+    );
     let res = match client
-        .get("https://api.github.com/repos/DarkPlayOff/YAYMA/releases/latest")
+        .get(releases_url)
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await
