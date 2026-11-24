@@ -259,6 +259,11 @@ class _MobileMiniPlayerState extends State<MobileMiniPlayer> {
         final meta = trackMetadataSignal();
         final playerOpen = mobileFullPlayerOpenSignal();
 
+        // Before anything is restored or played there is no plate to show.
+        // Rendering the empty glass slab left a blank square floating above
+        // the navbar on every tab, so the bar only exists once a track does.
+        if (meta.id == null) return const SizedBox.shrink();
+
         // Visual gap only: the Android system navigation inset is applied by
         // the app shell (Positioned bottom offset in layout.dart), so it
         // must not be added here a second time.
