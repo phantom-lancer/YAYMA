@@ -455,18 +455,14 @@ class _AnimatedCoverState extends State<_AnimatedCover> {
 
   /// The wave tab hides the mini player, so the artwork is the way into the
   /// full player (seek, queue, lyrics, sleep timer). It expands from its own
-  /// rect; the panel grows from a small plate centred on the artwork so both
-  /// the opening and the collapse stay centred on the cover.
+  /// rect; the panel grows from a small plate centred on the artwork, so the
+  /// opening and the collapse both stay anchored to the cover.
   void _openFullPlayer() {
     if (!widget.hasTrack) return;
     final box = _artworkKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null || !box.hasSize) return;
     final rect = box.localToGlobal(Offset.zero) & box.size;
-    final plate = Rect.fromCenter(
-      center: rect.center,
-      width: 96,
-      height: 72,
-    );
+    final plate = Rect.fromCenter(center: rect.center, width: 96, height: 72);
     mobileFullPlayerController.reset();
     mobileFullPlayerOrigin.value = MobileFullPlayerOrigin(
       plateRect: plate,
@@ -481,82 +477,87 @@ class _AnimatedCoverState extends State<_AnimatedCover> {
     final meta = widget.meta;
     final coverSize = widget.coverSize;
     final hasTrack = widget.hasTrack;
-    return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 420),
-      switchInCurve: Curves.easeOutCubic,
-      switchOutCurve: Curves.easeInCubic,
-      transitionBuilder: (child, animation) {
-        return FadeTransition(
-          opacity: animation,
-          child: ScaleTransition(
-            scale: Tween<double>(begin: 0.94, end: 1).animate(
-              CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
-            ),
-            child: child,
-          ),
-        );
-      },
-      child: Container(
-        key: ValueKey(meta.coverUrl ?? 'empty'),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(10),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.46),
-              blurRadius: 34,
-              spreadRadius: -6,
-              offset: const Offset(0, 18),
-            ),
-            if (hasTrack)
-              BoxShadow(
-                color: accentColorSignal.value.withValues(alpha: 0.22),
-                blurRadius: 44,
-                spreadRadius: 2,
+    // The key sits on the stable wrapper, not inside the switcher: while a
+    // cover change animates, the old and the new child coexist and two
+    // subtrees with the same GlobalKey would be a duplicate-key error.
+    return SizedBox(
+      key: _artworkKey,
+      width: coverSize,
+      height: coverSize,
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 420),
+        switchInCurve: Curves.easeOutCubic,
+        switchOutCurve: Curves.easeInCubic,
+        transitionBuilder: (child, animation) {
+          return FadeTransition(
+            opacity: animation,
+            child: ScaleTransition(
+              scale: Tween<double>(begin: 0.94, end: 1).animate(
+                CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
               ),
-          ],
-        ),
-        child: hasTrack
-            ? KeyedSubtree(
-                key: _artworkKey,
-                child: AppCover(
+              child: child,
+            ),
+          );
+        },
+        child: Container(
+          key: ValueKey(meta.coverUrl ?? 'empty'),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.46),
+                blurRadius: 34,
+                spreadRadius: -6,
+                offset: const Offset(0, 18),
+              ),
+              if (hasTrack)
+                BoxShadow(
+                  color: accentColorSignal.value.withValues(alpha: 0.22),
+                  blurRadius: 44,
+                  spreadRadius: 2,
+                ),
+            ],
+          ),
+          child: hasTrack
+              ? AppCover(
                   coverUrl: meta.coverUrl,
                   size: coverSize,
                   radius: 8,
                   onTap: _openFullPlayer,
-                ),
-              )
-            : GestureDetector(
-                onTap: () => unawaited(WaveController.startMyWave()),
-                child: LiquidGlassSurface(
-                  borderRadius: BorderRadius.circular(10),
-                  blurSigma: 22,
-                  tintOpacity: 0.18,
-                  padding: EdgeInsets.zero,
-                  child: SizedBox(
-                    width: coverSize,
-                    height: coverSize,
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          Icons.radio_rounded,
-                          color: Colors.white.withValues(alpha: 0.9),
-                          size: coverSize * 0.30,
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          'Начать волну',
-                          style: TextStyle(
+                )
+              : GestureDetector(
+                  onTap: () => unawaited(WaveController.startMyWave()),
+                  child: LiquidGlassSurface(
+                    borderRadius: BorderRadius.circular(10),
+                    blurSigma: 22,
+                    tintOpacity: 0.18,
+                    padding: EdgeInsets.zero,
+                    child: SizedBox(
+                      width: coverSize,
+                      height: coverSize,
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            Icons.radio_rounded,
                             color: Colors.white.withValues(alpha: 0.9),
-                            fontSize: 12,
-                            fontWeight: FontWeight.w700,
+                            size: coverSize * 0.30,
                           ),
-                        ),
-                      ],
+                          const SizedBox(height: 8),
+                          Text(
+                            'Начать волну',
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.9),
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
-              ),
+        ),
       ),
     );
   }
