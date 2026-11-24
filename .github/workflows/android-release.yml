@@ -119,7 +119,7 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           target_commitish: ${{ github.sha }}
-          name: "YAYAMA ${{ env.APP_VERSION }} - Android"
+          name: "YAYMA ${{ env.APP_VERSION }} - Android"
           body: |
             Android-only build of the YAYMA fork (upstream YAYMA 2.7.0).
 
