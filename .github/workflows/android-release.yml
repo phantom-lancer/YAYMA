@@ -97,9 +97,14 @@ jobs:
       - name: Collect APK
         run: |
           mkdir -p android_artifacts
+          # One source of truth: the version in pubspec, not a copy here that
+          # silently drifts behind it.
+          version="$(sed -n 's/^version: *\([^+]*\).*/\1/p' src/pubspec.yaml)"
+          test -n "$version"
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
           apk=src/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
           test -f "$apk"
-          cp "$apk" "android_artifacts/yayama-android-arm64-v8a-2.7.0.apk"
+          cp "$apk" "android_artifacts/yayama-android-arm64-v8a-$version.apk"
           ls -lh android_artifacts
 
       - name: Publish Android-only GitHub Release
@@ -107,7 +112,7 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           target_commitish: ${{ github.sha }}
-          name: "YAYAMA 2.7.0 - Android"
+          name: "YAYAMA ${{ env.APP_VERSION }} - Android"
           body: |
             Android-only build of the YAYMA fork (upstream YAYMA 2.7.0).
 
@@ -125,7 +130,7 @@ jobs:
             - Keeps the fork's wave renderer, sleep timer, play-next and existing settings.
 
             This release intentionally contains no desktop builds.
-          files: android_artifacts/yayama-android-arm64-v8a-2.7.0.apk
+          files: android_artifacts/yayama-android-arm64-v8a-${{ env.APP_VERSION }}.apk
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
