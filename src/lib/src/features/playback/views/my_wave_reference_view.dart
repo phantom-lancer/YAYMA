@@ -5,6 +5,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
+import 'package:yayma/src/features/core/views/layout/mobile_full_player.dart';
 import 'package:yayma/src/features/core/views/widgets/app_cover.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
 import 'package:yayma/src/features/core/views/widgets/liquid_glass.dart';
@@ -36,8 +37,8 @@ typedef _TrackProgress = ({double durationMs, double positionMs});
 /// scrolling shelf of real, tappable wave stations.
 ///
 /// It is deliberately a complete tab, not a decorative hero: every control is
-/// wired to the shared playback and wave controllers, and the cover opens the
-/// full-size artwork while the mode pill opens the full wave settings sheet.
+/// wired to the shared playback and wave controllers: the artwork expands into
+/// the full player, and the mode pill opens the full wave settings sheet.
 class MyWaveReferenceView extends StatelessWidget {
   const MyWaveReferenceView({super.key});
 
@@ -434,7 +435,7 @@ class _CoverAndControls extends StatelessWidget {
   }
 }
 
-class _AnimatedCover extends StatelessWidget {
+class _AnimatedCover extends StatefulWidget {
   const _AnimatedCover({
     required this.meta,
     required this.coverSize,
@@ -446,7 +447,34 @@ class _AnimatedCover extends StatelessWidget {
   final bool hasTrack;
 
   @override
+  State<_AnimatedCover> createState() => _AnimatedCoverState();
+}
+
+class _AnimatedCoverState extends State<_AnimatedCover> {
+  final _artworkKey = GlobalKey();
+
+  /// The wave tab hides the mini player, so the artwork is the way into the
+  /// full player (seek, queue, lyrics, sleep timer). It expands from its own
+  /// rect, which is exactly the geometry the player already animates from.
+  void _openFullPlayer() {
+    if (!widget.hasTrack) return;
+    final box = _artworkKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return;
+    final rect = box.localToGlobal(Offset.zero) & box.size;
+    mobileFullPlayerController.reset();
+    mobileFullPlayerOrigin.value = MobileFullPlayerOrigin(
+      plateRect: rect,
+      coverRect: rect,
+    );
+    mobileMiniPlayerPlateRect.value = rect;
+    mobileFullPlayerOpenSignal.value = true;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final meta = widget.meta;
+    final coverSize = widget.coverSize;
+    final hasTrack = widget.hasTrack;
     return AnimatedSwitcher(
       duration: const Duration(milliseconds: 420),
       switchInCurve: Curves.easeOutCubic,
@@ -482,11 +510,14 @@ class _AnimatedCover extends StatelessWidget {
           ],
         ),
         child: hasTrack
-            ? AppCover(
-                coverUrl: meta.coverUrl,
-                size: coverSize,
-                radius: 8,
-                canExpand: true,
+            ? KeyedSubtree(
+                key: _artworkKey,
+                child: AppCover(
+                  coverUrl: meta.coverUrl,
+                  size: coverSize,
+                  radius: 8,
+                  onTap: _openFullPlayer,
+                ),
               )
             : GestureDetector(
                 onTap: () => unawaited(WaveController.startMyWave()),

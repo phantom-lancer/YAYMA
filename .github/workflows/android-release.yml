@@ -109,11 +109,20 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: "YAYAMA 2.7.0 - Android"
           body: |
-            Android-only build of the YAYAMA fork, synced with upstream YAYMA v2.7.0.
+            Android-only build of the YAYMA fork (upstream YAYMA 2.7.0).
 
-            - Architecture: Android ARM64 (arm64-v8a)
-            - Keeps the fork's Android appearance profiles, wave renderer, Liquid Glass settings and sleep timer.
-            - Includes compatible upstream playback, queue, history, lyrics and stability updates.
+            - Architecture: Android ARM64 (arm64-v8a), signed with the persistent fork keystore.
+            - "Моя волна" rebuilt after the official composition: add/search top bar, oversized
+              track title, centred artwork, pause / mode / like row and swipeable station cards.
+            - Liquid Glass is now optical: backdrop sampling, a runtime refraction shader with
+              caustics, a Fresnel rim and a specular lobe, preloaded and cached with a quiet
+              translucent fallback. It can be switched off in Settings.
+            - Audio quality is configured separately for Wi-Fi/Ethernet and mobile data, applied
+              automatically on network changes while keeping the queue and playback position.
+            - Whole-app appearance switch: YAYMA / Liquid Glass and Apple Music, persisted.
+            - Fixes the navbar overflow that clipped the account avatar and the dead strip under
+              the wave mini-player; icon-only phone navbar with equal slots and haptics.
+            - Keeps the fork's wave renderer, sleep timer, play-next and existing settings.
 
             This release intentionally contains no desktop builds.
           files: android_artifacts/yayama-android-arm64-v8a-2.7.0.apk
