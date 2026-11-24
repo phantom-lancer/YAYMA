@@ -455,18 +455,24 @@ class _AnimatedCoverState extends State<_AnimatedCover> {
 
   /// The wave tab hides the mini player, so the artwork is the way into the
   /// full player (seek, queue, lyrics, sleep timer). It expands from its own
-  /// rect, which is exactly the geometry the player already animates from.
+  /// rect; the panel grows from a small plate centred on the artwork so both
+  /// the opening and the collapse stay centred on the cover.
   void _openFullPlayer() {
     if (!widget.hasTrack) return;
     final box = _artworkKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null || !box.hasSize) return;
     final rect = box.localToGlobal(Offset.zero) & box.size;
+    final plate = Rect.fromCenter(
+      center: rect.center,
+      width: 96,
+      height: 72,
+    );
     mobileFullPlayerController.reset();
     mobileFullPlayerOrigin.value = MobileFullPlayerOrigin(
-      plateRect: rect,
+      plateRect: plate,
       coverRect: rect,
     );
-    mobileMiniPlayerPlateRect.value = rect;
+    mobileMiniPlayerPlateRect.value = plate;
     mobileFullPlayerOpenSignal.value = true;
   }
 
