@@ -617,7 +617,7 @@ class _WindowContent extends StatelessWidget {
           final profile = androidAppearanceProfileSignal.value;
           bottomPadding = profile == AndroidAppearanceProfile.yayama
               ? 96
-              : 78;
+              : 84;
           bottomPadding += MediaQuery.viewPaddingOf(context).bottom;
         } else if (isHome && isNarrow) {
           // Home is centered non-scrollable content: its bottom row
