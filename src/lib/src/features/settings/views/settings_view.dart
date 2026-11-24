@@ -344,7 +344,7 @@ class _SettingsViewState extends State<SettingsView> {
                     Expanded(
                       child: _AppearanceModeTile(
                         title: 'Apple Music',
-                        subtitle: 'Светлое стекло',
+                        subtitle: 'Графит и красный',
                         icon: Icons.music_note_rounded,
                         selected: profile == AndroidAppearanceProfile.appleMusic,
                         colors: const [Color(0xFFFF5A6E), Color(0xFF8E1D35)],

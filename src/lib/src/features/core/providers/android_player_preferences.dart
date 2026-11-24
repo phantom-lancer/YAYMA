@@ -27,7 +27,7 @@ extension AndroidAppearanceProfileLabel on AndroidAppearanceProfile {
     AndroidAppearanceProfile.yandexMusic =>
       'Новая главная «Моя волна» и оптическое стекло',
     AndroidAppearanceProfile.appleMusic =>
-      'Светлое стекло и композиция Apple Music',
+      'Графит, красный акцент и композиция Apple Music',
     AndroidAppearanceProfile.current => 'Сохранённый Android-редизайн',
   };
 }
