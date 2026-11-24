@@ -92,7 +92,7 @@ class MyWaveReferenceView extends StatelessWidget {
                     ),
                   ),
                   SizedBox(
-                    height: compact ? 142 : 172,
+                    height: compact ? 156 : 186,
                     child: const _WaveStationShelf(),
                   ),
                 ],
@@ -802,6 +802,7 @@ class _StationBlobState extends State<_StationBlob> {
   Widget build(BuildContext context) {
     final visual = widget.visual;
     final color = visual.colors.first;
+    final radius = BorderRadius.circular(38);
     return Semantics(
       button: true,
       selected: widget.selected,
@@ -815,101 +816,121 @@ class _StationBlobState extends State<_StationBlob> {
           unawaited(WaveController.toggleStation(visual.seed));
         },
         child: AnimatedScale(
-          scale: _pressed ? 0.965 : 1,
-          duration: const Duration(milliseconds: 140),
+          scale: _pressed ? 0.955 : 1,
+          duration: const Duration(milliseconds: 150),
           curve: Curves.easeOutCubic,
           child: AnimatedContainer(
-            duration: const Duration(milliseconds: 220),
+            duration: const Duration(milliseconds: 260),
+            curve: Curves.easeOutCubic,
             width: widget.width,
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(28),
+              borderRadius: radius,
               gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: visual.colors,
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  Color.lerp(visual.colors.first, Colors.white, 0.16)!,
+                  visual.colors.first,
+                  visual.colors.last,
+                ],
+                stops: const [0, 0.42, 1],
               ),
               border: Border.all(
                 color: Colors.white.withValues(
-                  alpha: widget.selected ? 0.88 : 0.10,
+                  alpha: widget.selected ? 0.9 : 0.12,
                 ),
-                width: widget.selected ? 1.6 : 1,
+                width: widget.selected ? 1.8 : 1,
               ),
               boxShadow: [
                 BoxShadow(
-                  color: color.withValues(alpha: 0.38),
-                  blurRadius: 26,
-                  spreadRadius: -4,
-                  offset: const Offset(0, 10),
+                  color: color.withValues(
+                    alpha: widget.selected ? 0.52 : 0.32,
+                  ),
+                  blurRadius: widget.selected ? 34 : 24,
+                  spreadRadius: widget.selected ? 2 : -6,
+                  offset: const Offset(0, 12),
                 ),
               ],
             ),
             child: ClipRRect(
-              borderRadius: BorderRadius.circular(28),
+              borderRadius: radius,
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  Positioned(
-                    right: -18,
-                    top: -22,
-                    child: Icon(
-                      visual.icon,
-                      size: widget.width * 0.46,
-                      color: Colors.white.withValues(alpha: 0.09),
+                  // Soft key light from above: the card reads as a lit solid,
+                  // not a flat swatch.
+                  const DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: RadialGradient(
+                        center: Alignment(0, -0.85),
+                        radius: 1.1,
+                        colors: [Color(0x33FFFFFF), Color(0x00000000)],
+                      ),
                     ),
                   ),
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 14, 14, 14),
+                    padding: const EdgeInsets.fromLTRB(14, 18, 14, 18),
                     child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        Row(
-                          children: [
-                            Container(
-                              width: 34,
-                              height: 34,
-                              decoration: BoxDecoration(
-                                color: Colors.white.withValues(alpha: 0.16),
-                                shape: BoxShape.circle,
+                        Container(
+                          width: 54,
+                          height: 54,
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.16),
+                            shape: BoxShape.circle,
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.white.withValues(alpha: 0.18),
+                                blurRadius: 22,
+                                spreadRadius: 2,
                               ),
-                              child: Icon(
-                                visual.icon,
-                                color: Colors.white,
-                                size: 19,
-                              ),
-                            ),
-                            const Spacer(),
-                            if (widget.selected)
-                              Container(
-                                width: 22,
-                                height: 22,
-                                decoration: BoxDecoration(
-                                  color: Colors.white.withValues(alpha: 0.92),
-                                  shape: BoxShape.circle,
-                                ),
-                                child: Icon(
-                                  Icons.check_rounded,
-                                  size: 15,
-                                  color: visual.colors.last,
-                                ),
-                              ),
-                          ],
+                            ],
+                          ),
+                          child: Icon(
+                            visual.icon,
+                            color: Colors.white,
+                            size: 28,
+                          ),
                         ),
-                        const Spacer(),
+                        const SizedBox(height: 12),
                         Text(
                           visual.label,
-                          maxLines: 3,
+                          textAlign: TextAlign.center,
+                          maxLines: 2,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
                             color: Colors.white,
-                            fontSize: 13.5,
+                            fontSize: 14,
                             height: 1.12,
                             fontWeight: FontWeight.w800,
                             letterSpacing: -0.15,
+                            shadows: [
+                              Shadow(color: Color(0x66000000), blurRadius: 8),
+                            ],
                           ),
                         ),
                       ],
                     ),
                   ),
+                  if (widget.selected)
+                    Positioned(
+                      top: 10,
+                      right: 10,
+                      child: Container(
+                        width: 22,
+                        height: 22,
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.94),
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          Icons.check_rounded,
+                          size: 15,
+                          color: visual.colors.last,
+                        ),
+                      ),
+                    ),
                 ],
               ),
             ),
