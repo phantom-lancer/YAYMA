@@ -108,5 +108,10 @@ void main() {
     float innerShade = smoothstep(-14.0, -1.0, sd) * inside;
     color *= 1.0 - 0.16 * (1.0 - innerShade);
 
-    fragColor = vec4(clamp(color, 0.0, 1.0), clamp(alpha, 0.0, 1.0));
+    color = clamp(color, 0.0, 1.0);
+    alpha = clamp(alpha, 0.0, 1.0);
+    // Flutter composites runtime effects with premultiplied alpha, so the
+    // highlights must be scaled by their own coverage or a nearly transparent
+    // pane would still add full-strength white.
+    fragColor = vec4(color * alpha, alpha);
 }

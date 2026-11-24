@@ -109,8 +109,9 @@ abstract final class NetworkQualityController {
       appLog(AppLogLevel.warn, 'network event stream unavailable: $error');
     }
     // The event channel sends the initial value, but a missed first event
-    // (engine restart, Doze) must not leave the profile unapplied.
-    _poll = Timer.periodic(const Duration(seconds: 30), (_) {
+    // (engine restart, Doze) must not leave the profile unapplied. This is a
+    // fallback, not the primary path, so it stays infrequent.
+    _poll = Timer.periodic(const Duration(minutes: 3), (_) {
       unawaited(refreshNetwork());
     });
     await refreshNetwork();
