@@ -83,7 +83,7 @@ void main() {
     float softGlow = exp(-length(lightP - p) / max(uSize.x, uSize.y) * 2.4);
 
     // Fresnel: light gathers at the rim, strongest on the top-left edge.
-    float inside = smoothstep(1.4, -1.4, sd);
+    float inside = 1.0 - smoothstep(-1.4, 1.4, sd);
     float rim = smoothstep(-3.0, 0.0, sd) * inside;
     float rimBias = 0.55 + 0.45 * clamp(0.5 - uv.x + (1.0 - uv.y), 0.0, 1.0);
 
