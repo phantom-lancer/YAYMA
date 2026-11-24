@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
@@ -74,9 +75,10 @@ class MyWaveReferenceView extends StatelessWidget {
                             compact: compact,
                           ),
                         ),
-                        Flexible(
+                        Expanded(
                           flex: 7,
                           child: _CoverAndControls(
+                            width: constraints.maxWidth - horizontal * 2,
                             meta: meta,
                             playing: playing,
                             buffering: buffering,
@@ -257,6 +259,7 @@ class _GiantTrackTitle extends StatelessWidget {
 
 class _CoverAndControls extends StatelessWidget {
   const _CoverAndControls({
+    required this.width,
     required this.meta,
     required this.playing,
     required this.buffering,
@@ -266,6 +269,7 @@ class _CoverAndControls extends StatelessWidget {
     required this.compact,
   });
 
+  final double width;
   final _TrackMeta meta;
   final bool playing;
   final bool buffering;
@@ -276,115 +280,128 @@ class _CoverAndControls extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final width = MediaQuery.sizeOf(context).width;
     final coverSize = (width * (compact ? 0.29 : 0.315))
         .clamp(92.0, 196.0)
         .toDouble();
     final mode = _modeLabel(seeds);
 
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        _AnimatedCover(
-          meta: meta,
-          coverSize: coverSize,
-          hasTrack: hasTrack,
-        ),
-        SizedBox(height: compact ? 14 : 20),
-        Row(
+    // The block is sized by its contents and only shrinks when a short screen
+    // leaves less room than the cover, controls and progress line need: an
+    // overflow here would paint the debug stripes over the hero controls.
+    return FittedBox(
+      fit: BoxFit.scaleDown,
+      alignment: Alignment.center,
+      child: SizedBox(
+        width: width,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            _CircleGlassAction(
-              label: playing ? 'Пауза' : 'Играть',
-              size: compact ? 58 : 64,
-              onTap: () {
-                if (hasTrack) {
-                  unawaited(PlaybackController.togglePlay());
-                } else {
-                  unawaited(WaveController.startMyWave());
-                }
-              },
-              child: buffering
-                  ? const SizedBox(
-                      width: 22,
-                      height: 22,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2.4,
-                        color: Colors.white,
-                      ),
-                    )
-                  : Icon(
-                      playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                      color: Colors.white,
-                      size: compact ? 28 : 32,
-                    ),
+            _AnimatedCover(
+              meta: meta,
+              coverSize: coverSize,
+              hasTrack: hasTrack,
             ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: LiquidGlassSurface(
-                borderRadius: BorderRadius.circular(AppRadius.full),
-                blurSigma: 22,
-                tintOpacity: 0.22,
-                animated: true,
-                intensity: 0.9,
-                padding: EdgeInsets.zero,
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(AppRadius.full),
-                  onTap: () => showWaveSettingsSheet(context),
-                  child: SizedBox(
-                    height: compact ? 58 : 64,
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Flexible(
-                          child: Text(
-                            mode.toUpperCase(),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: compact ? 14 : 16,
-                              fontWeight: FontWeight.w900,
-                              letterSpacing: 0.2,
-                            ),
+            SizedBox(height: compact ? 14 : 20),
+            Row(
+              children: [
+                _CircleGlassAction(
+                  label: playing ? 'Пауза' : 'Играть',
+                  size: compact ? 58 : 64,
+                  onTap: () {
+                    if (hasTrack) {
+                      unawaited(PlaybackController.togglePlay());
+                    } else {
+                      unawaited(WaveController.startMyWave());
+                    }
+                  },
+                  child: buffering
+                      ? const SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2.4,
+                            color: Colors.white,
                           ),
+                        )
+                      : Icon(
+                          playing
+                              ? Icons.pause_rounded
+                              : Icons.play_arrow_rounded,
+                          color: Colors.white,
+                          size: compact ? 28 : 32,
                         ),
-                        const SizedBox(width: 6),
-                        const Icon(
-                          Icons.info_outline_rounded,
-                          color: Colors.white70,
-                          size: 17,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: LiquidGlassSurface(
+                    borderRadius: BorderRadius.circular(AppRadius.full),
+                    blurSigma: 22,
+                    tintOpacity: 0.22,
+                    animated: true,
+                    intensity: 0.9,
+                    padding: EdgeInsets.zero,
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(AppRadius.full),
+                      onTap: () => showWaveSettingsSheet(context),
+                      child: SizedBox(
+                        height: compact ? 58 : 64,
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Flexible(
+                              child: Text(
+                                mode.toUpperCase(),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: compact ? 14 : 16,
+                                  fontWeight: FontWeight.w900,
+                                  letterSpacing: 0.2,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            const Icon(
+                              Icons.info_outline_rounded,
+                              color: Colors.white70,
+                              size: 17,
+                            ),
+                          ],
                         ),
-                      ],
+                      ),
                     ),
                   ),
                 ),
-              ),
+                const SizedBox(width: 10),
+                _CircleGlassAction(
+                  label: liked ? 'Убрать из избранного' : 'В избранное',
+                  size: compact ? 58 : 64,
+                  onTap: hasTrack
+                      ? () => unawaited(
+                          PlaybackController.toggleLike(trackId: meta.id!),
+                        )
+                      : null,
+                  child: Icon(
+                    liked
+                        ? Icons.favorite_rounded
+                        : Icons.favorite_border_rounded,
+                    color: liked ? const Color(0xFFFF6B8A) : Colors.white,
+                    size: compact ? 26 : 29,
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(width: 10),
-            _CircleGlassAction(
-              label: liked ? 'Убрать из избранного' : 'В избранное',
-              size: compact ? 58 : 64,
-              onTap: hasTrack
-                  ? () => unawaited(
-                      PlaybackController.toggleLike(trackId: meta.id!),
-                    )
-                  : null,
-              child: Icon(
-                liked ? Icons.favorite_rounded : Icons.favorite_border_rounded,
-                color: liked ? const Color(0xFFFF6B8A) : Colors.white,
-                size: compact ? 26 : 29,
+            SizedBox(height: compact ? 10 : 14),
+            SignalBuilder(
+              builder: (context) => _ThinWaveProgress(
+                progress: trackProgressSignal(),
+                enabled: hasTrack,
               ),
             ),
           ],
         ),
-        SizedBox(height: compact ? 10 : 14),
-        SignalBuilder(
-          builder: (context) => _ThinWaveProgress(
-            progress: trackProgressSignal(),
-            enabled: hasTrack,
-          ),
-        ),
-      ],
+      ),
     );
   }
 
@@ -537,7 +554,12 @@ class _CircleGlassAction extends StatelessWidget {
           padding: EdgeInsets.zero,
           child: InkWell(
             customBorder: const CircleBorder(),
-            onTap: onTap,
+            onTap: onTap == null
+                ? null
+                : () {
+                    unawaited(HapticFeedback.selectionClick());
+                    onTap!();
+                  },
             child: SizedBox(
               width: size,
               height: size,
@@ -788,7 +810,10 @@ class _StationBlobState extends State<_StationBlob> {
         onTapDown: (_) => setState(() => _pressed = true),
         onTapCancel: () => setState(() => _pressed = false),
         onTapUp: (_) => setState(() => _pressed = false),
-        onTap: () => unawaited(WaveController.toggleStation(visual.seed)),
+        onTap: () {
+          unawaited(HapticFeedback.selectionClick());
+          unawaited(WaveController.toggleStation(visual.seed));
+        },
         child: AnimatedScale(
           scale: _pressed ? 0.965 : 1,
           duration: const Duration(milliseconds: 140),

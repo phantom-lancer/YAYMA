@@ -801,6 +801,10 @@ class _NavIconState extends State<_NavIcon> with TickerProviderStateMixin {
         widget.isNarrow &&
         Theme.of(context).platform == TargetPlatform.android &&
         widget.label != null;
+    // On the phone the pill itself is the touch feedback even when the item
+    // is icon-only; the ink splash would paint a second, mismatched highlight.
+    final phonePill =
+        widget.isNarrow && Theme.of(context).platform == TargetPlatform.android;
     final pill = AnimatedBuilder(
       animation: _progress,
       builder: (context, _) {
@@ -822,7 +826,7 @@ class _NavIconState extends State<_NavIcon> with TickerProviderStateMixin {
             onPressed: widget.onTap,
             // On the phone the pill itself is the touch feedback; the ink
             // splash would paint a second, mismatched highlight over it.
-            style: labelsInline
+            style: phonePill
                 ? IconButton.styleFrom(
                     splashFactory: NoSplash.splashFactory,
                     overlayColor: Colors.transparent,
