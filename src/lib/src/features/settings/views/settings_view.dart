@@ -602,11 +602,6 @@ class _SettingsViewState extends State<SettingsView> {
                   ? showNetworkQualitySheet(context)
                   : showAudioQualitySheet(context),
             ),
-            trailing: Icon(
-              Icons.chevron_right_rounded,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-              size: 22,
-            ),
           );
         },
       ),
