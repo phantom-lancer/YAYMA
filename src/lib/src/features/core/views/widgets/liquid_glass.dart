@@ -216,16 +216,17 @@ class _LiquidGlassSurfaceState extends State<LiquidGlassSurface>
             child: Stack(
               fit: StackFit.passthrough,
               children: [
-                Positioned.fill(
-                  child: BackdropFilter(
-                    enabled: blur,
-                    filter: ui.ImageFilter.blur(
-                      sigmaX: widget.blurSigma,
-                      sigmaY: widget.blurSigma,
+                if (widget.blurSigma > 0)
+                  Positioned.fill(
+                    child: BackdropFilter(
+                      enabled: blur,
+                      filter: ui.ImageFilter.blur(
+                        sigmaX: widget.blurSigma,
+                        sigmaY: widget.blurSigma,
+                      ),
+                      child: const SizedBox.expand(),
                     ),
-                    child: const SizedBox.expand(),
                   ),
-                ),
                 Positioned.fill(
                   child: DecoratedBox(
                     decoration: BoxDecoration(

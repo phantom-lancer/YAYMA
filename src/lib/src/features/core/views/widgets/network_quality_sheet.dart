@@ -90,7 +90,9 @@ class NetworkQualitySheet extends StatelessWidget {
                   const SizedBox(height: 14),
                   LiquidGlassSurface(
                     borderRadius: BorderRadius.circular(AppRadius.lg),
-                    blurSigma: 18,
+                    // The sheet already blurs the app behind it; blurring
+                    // again inside would only cost a second backdrop pass.
+                    blurSigma: 0,
                     tintOpacity: 0.20,
                     shadows: false,
                     padding: const EdgeInsets.fromLTRB(14, 10, 12, 10),
@@ -322,7 +324,7 @@ class _QualityProfileCard extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     return LiquidGlassSurface(
       borderRadius: BorderRadius.circular(AppRadius.lg),
-      blurSigma: 18,
+      blurSigma: 0,
       tintOpacity: 0.22,
       shadows: false,
       padding: const EdgeInsets.all(14),
