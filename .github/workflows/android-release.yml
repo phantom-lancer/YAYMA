@@ -87,6 +87,13 @@ jobs:
       - name: Restore Bridge
         uses: ./.github/actions/restore-bridge
 
+      - name: Dart tests
+        working-directory: ./src
+        run: |
+          flutter config --no-analytics
+          flutter pub get
+          flutter test --reporter expanded
+
       - name: Build Android ARM64 APK
         working-directory: ./src
         run: |

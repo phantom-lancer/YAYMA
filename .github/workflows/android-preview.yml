@@ -97,9 +97,7 @@ jobs:
         working-directory: ./src
         # The suite builds native assets: cnativeapi needs the GTK/X11
         # headers and the Rust host build of the crate needs ALSA, all
-        # installed above. Reported here, never blocking, because this
-        # workflow's deliverable is the APK.
-        continue-on-error: true
+        # installed above.
         run: |
           flutter config --no-analytics
           flutter pub get
