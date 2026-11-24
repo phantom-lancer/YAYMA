@@ -15,9 +15,13 @@ import 'package:yayma/src/features/core/providers/notification_provider.dart';
 import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 import 'package:yayma/src/features/core/services/app_logger.dart';
 import 'package:yayma/src/features/core/services/global_hotkey_service.dart';
+import 'package:yayma/src/features/core/services/network_quality.dart';
 import 'package:yayma/src/features/core/services/rust_bridge.dart';
 import 'package:yayma/src/features/core/theme/app_tokens.dart';
+import 'package:yayma/src/features/core/views/widgets/audio_quality_sheet.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
+import 'package:yayma/src/features/core/views/widgets/liquid_glass.dart';
+import 'package:yayma/src/features/core/views/widgets/network_quality_sheet.dart';
 import 'package:yayma/src/features/core/views/widgets/responsive.dart';
 import 'package:yayma/src/features/core/views/widgets/rust_cached_image.dart';
 import 'package:yayma/src/features/core/views/widgets/smooth_scroll.dart';
@@ -313,37 +317,89 @@ class _SettingsViewState extends State<SettingsView> {
         SignalBuilder(
           builder: (context) {
             final profile = androidAppearanceProfileSignal.value;
-            return _SettingItem(
-              title: 'Стиль интерфейса',
-              subtitle: profile.title + ' - ' + profile.description,
-              icon: Icons.palette_outlined,
-              onTap: () {},
-              trailing: SizedBox(
-                width: isNarrow ? 148 : 220,
-                child: DropdownButton<AndroidAppearanceProfile>(
-                  isExpanded: true,
-                  value: profile,
-                  underline: const SizedBox.shrink(),
-                  borderRadius: BorderRadius.circular(18),
-                  onChanged: (value) {
-                    if (value != null) {
-                      unawaited(AndroidPlayerPreferences.setProfile(value));
-                    }
-                  },
-                  items: AndroidAppearanceProfile.values
-                      .map(
-                        (option) => DropdownMenuItem<AndroidAppearanceProfile>(
-                          value: option,
-                          child: Text(
-                            option.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+            final legacy =
+                profile == AndroidAppearanceProfile.yayama ||
+                profile == AndroidAppearanceProfile.current;
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: _AppearanceModeTile(
+                        title: 'YAYMA',
+                        subtitle: 'Liquid Glass',
+                        icon: Icons.auto_awesome_rounded,
+                        selected:
+                            profile == AndroidAppearanceProfile.yandexMusic,
+                        colors: const [Color(0xFF7A4DFF), Color(0xFF3B1D8F)],
+                        onTap: () => unawaited(
+                          AndroidPlayerPreferences.setProfile(
+                            AndroidAppearanceProfile.yandexMusic,
                           ),
                         ),
-                      )
-                      .toList(),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: _AppearanceModeTile(
+                        title: 'Apple Music',
+                        subtitle: 'Светлое стекло',
+                        icon: Icons.music_note_rounded,
+                        selected: profile == AndroidAppearanceProfile.appleMusic,
+                        colors: const [Color(0xFFFF5A6E), Color(0xFF8E1D35)],
+                        onTap: () => unawaited(
+                          AndroidPlayerPreferences.setProfile(
+                            AndroidAppearanceProfile.appleMusic,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-              ),
+                const SizedBox(height: 12),
+                _SettingItem(
+                  title: 'Классические стили',
+                  subtitle: legacy
+                      ? '${profile.title} · ${profile.description}'
+                      : 'Оригинальная волна и сохранённый редизайн',
+                  icon: Icons.layers_outlined,
+                  onTap: () {},
+                  trailing: SizedBox(
+                    width: isNarrow ? 140 : 200,
+                    child: DropdownButton<AndroidAppearanceProfile>(
+                      isExpanded: true,
+                      value: legacy ? profile : null,
+                      hint: const Text('Выбрать'),
+                      underline: const SizedBox.shrink(),
+                      borderRadius: BorderRadius.circular(18),
+                      onChanged: (value) {
+                        if (value != null) {
+                          unawaited(
+                            AndroidPlayerPreferences.setProfile(value),
+                          );
+                        }
+                      },
+                      items: const [
+                        AndroidAppearanceProfile.yayama,
+                        AndroidAppearanceProfile.current,
+                      ]
+                          .map(
+                            (option) =>
+                                DropdownMenuItem<AndroidAppearanceProfile>(
+                                  value: option,
+                                  child: Text(
+                                    option.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                          )
+                          .toList(),
+                    ),
+                  ),
+                ),
+              ],
             );
           },
         ),
@@ -420,7 +476,7 @@ class _SettingsViewState extends State<SettingsView> {
             return _SettingItem(
               title: 'Liquid Glass v2',
               subtitle:
-                  'Многослойное стекло, блики и глубокое размытие в меню и уведомлениях',
+                  'Настоящее стекло: преломление, каустика, блики и свет по краям',
               icon: Icons.blur_circular_rounded,
               onTap: () => unawaited(_toggleLiquidGlassV2(!enabled)),
               trailing: Switch(
@@ -526,6 +582,35 @@ class _SettingsViewState extends State<SettingsView> {
     return [
       const _SectionTitle(title: 'Воспроизведение'),
       const SizedBox(height: 20),
+      SignalBuilder(
+        builder: (context) {
+          final auto = autoQualityByNetworkSignal.value;
+          final wifi = wifiQualitySignal.value;
+          final mobile = mobileQualitySignal.value;
+          final androidProfiles = Platform.isAndroid;
+          return _SettingItem(
+            title: 'Качество звука',
+            subtitle: androidProfiles
+                ? (auto
+                      ? 'Wi-Fi: ${wifi.title} · Мобильный: ${mobile.title}'
+                      : 'Автопрофили выключены · '
+                            '${audioQualitySignal.value.title}')
+                : audioQualitySignal.value.title,
+            icon: Icons.high_quality_rounded,
+            onTap: () => unawaited(
+              androidProfiles
+                  ? showNetworkQualitySheet(context)
+                  : showAudioQualitySheet(context),
+            ),
+            trailing: Icon(
+              Icons.chevron_right_rounded,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+              size: 22,
+            ),
+          );
+        },
+      ),
+      const SizedBox(height: 8),
       SignalBuilder(
         builder: (context) {
           final enabled = crossfadeEnabledSignal.value;
@@ -1419,6 +1504,108 @@ class _AboutAppCard extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _AppearanceModeTile extends StatelessWidget {
+  const _AppearanceModeTile({
+    required this.title,
+    required this.subtitle,
+    required this.icon,
+    required this.selected,
+    required this.colors,
+    required this.onTap,
+  });
+
+  final String title;
+  final String subtitle;
+  final IconData icon;
+  final bool selected;
+  final List<Color> colors;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Semantics(
+      selected: selected,
+      button: true,
+      label: '$title, $subtitle',
+      child: LiquidGlassSurface(
+        borderRadius: BorderRadius.circular(AppRadius.lg),
+        blurSigma: 20,
+        tintOpacity: 0.18,
+        shadows: false,
+        padding: const EdgeInsets.all(2),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+          onTap: onTap,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 240),
+            curve: Curves.easeOutCubic,
+            padding: const EdgeInsets.fromLTRB(14, 12, 12, 12),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(AppRadius.md),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: colors
+                    .map((c) => c.withValues(alpha: selected ? 0.34 : 0.18))
+                    .toList(),
+              ),
+              border: Border.all(
+                color: selected
+                    ? scheme.onSurface.withValues(alpha: 0.44)
+                    : scheme.onSurface.withValues(alpha: 0.08),
+                width: selected ? 1.4 : 1,
+              ),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(icon, color: Colors.white, size: 22),
+                    const Spacer(),
+                    AnimatedOpacity(
+                      opacity: selected ? 1 : 0,
+                      duration: const Duration(milliseconds: 180),
+                      child: Icon(
+                        Icons.check_circle_rounded,
+                        color: Colors.white,
+                        size: 18,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 18),
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: -0.2,
+                  ),
+                ),
+                Text(
+                  subtitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.72),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

@@ -3,10 +3,12 @@ import 'dart:io';
 
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
+import 'package:yayma/src/features/core/services/network_quality.dart';
 import 'package:yayma/src/features/core/views/widgets/app_context_menu.dart';
 import 'package:yayma/src/features/core/views/widgets/audio_settings.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
 import 'package:yayma/src/features/core/views/widgets/tab_visibility.dart';
+import 'package:yayma/src/features/core/views/widgets/network_quality_sheet.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/rust/api/models.dart';
 
@@ -74,6 +76,12 @@ class CommonQualitySelector extends SignalWidget {
             isSelected: quality == AudioQuality.high,
             color: quality == AudioQuality.high ? accentColor : null,
           ),
+          if (Platform.isAndroid)
+            const AppContextMenuItem(
+              value: 'network_quality',
+              label: 'Профили качества по сети',
+              icon: Icons.network_cell_rounded,
+            ),
           // Linux routing belongs to the sound server (pavucontrol, GNOME/KDE
           // settings); the picker would only offer the default, so hide it.
           if (!Platform.isLinux)
@@ -122,8 +130,11 @@ class CommonQualitySelector extends SignalWidget {
           onSelected: (val) {
             if (val is AudioQuality) {
               unawaited(PlaybackController.setQuality(val));
+              unawaited(NetworkQualityController.recordManualQuality(val));
             } else if (val is _DeviceChoice) {
               unawaited(setAudioDevice(val.name));
+            } else if (val == 'network_quality') {
+              unawaited(showNetworkQualitySheet(context));
             } else if (val == 'eq') {
               unawaited(refreshEqualizer());
               unawaited(refreshAudioEffects());

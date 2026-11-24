@@ -11,6 +11,8 @@ import 'package:yayma/src/features/core/providers/navigation_provider.dart';
 import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/providers/visual_effects_provider.dart';
 import 'package:yayma/src/features/core/services/app_logger.dart';
+import 'package:yayma/src/features/core/services/network_quality.dart';
+import 'package:yayma/src/features/core/views/widgets/liquid_glass.dart';
 import 'package:yayma/src/features/library/providers/library_provider.dart';
 import 'package:yayma/src/features/playback/providers/audio_focus_manager.dart';
 import 'package:yayma/src/features/playback/providers/audio_handler.dart';
@@ -36,11 +38,13 @@ class AppInit {
 
       await RustLib.init();
       await AndroidPlayerPreferences.load();
+      await NetworkQualityController.init();
 
       unawaited(UpdateService.cleanupDownloadedApk());
 
       if (Platform.isAndroid) {
         await _initAudioService();
+        unawaited(GlassShaderCache.ensureLoaded());
       }
 
       final appDir = await _resolveDataDir();
@@ -188,6 +192,7 @@ class AppInit {
       // Initialize playback locally before showing UI
       await initPlayback();
       if (epoch != _authEpoch) return;
+      await NetworkQualityController.applyCurrent();
 
       // Fetch network-dependent data in the background
       unawaited(_loadAccountInfo(context, epoch));
@@ -241,6 +246,7 @@ class AppInit {
       await _applyAndroidWavePreference(context);
       await initPlayback();
       if (epoch != _authEpoch) return;
+      await NetworkQualityController.applyCurrent();
 
       unawaited(_loadAccountInfo(context, epoch));
       unawaited(_syncAiContentReduction(context, epoch));

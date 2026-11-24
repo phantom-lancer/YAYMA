@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:material_ui/material_ui.dart';
 import 'package:signals_flutter/signals_flutter.dart';
+import 'package:yayma/src/features/core/services/network_quality.dart';
 import 'package:yayma/src/features/core/views/widgets/audio_settings.dart';
 import 'package:yayma/src/features/core/views/widgets/common_ui.dart';
+import 'package:yayma/src/features/core/views/widgets/network_quality_sheet.dart';
 import 'package:yayma/src/features/playback/providers/playback_provider.dart';
 import 'package:yayma/src/rust/api/models.dart';
 
@@ -84,6 +87,28 @@ class _AudioQualitySheet extends StatelessWidget {
                   endIndent: 24,
                   color: cs.onSurface.withValues(alpha: 0.08),
                 ),
+                if (Platform.isAndroid)
+                  ListTile(
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 24),
+                    leading: Icon(Icons.network_cell_rounded, color: accent),
+                    title: Text(
+                      'Профили по сети',
+                      style: TextStyle(color: cs.onSurface, fontSize: 16),
+                    ),
+                    subtitle: Text(
+                      'Отдельное качество для Wi-Fi и мобильного интернета',
+                      style: TextStyle(
+                        color: cs.onSurfaceVariant,
+                        fontSize: 12,
+                      ),
+                    ),
+                    trailing: Icon(
+                      Icons.chevron_right_rounded,
+                      size: 22,
+                      color: cs.onSurfaceVariant,
+                    ),
+                    onTap: () => unawaited(_openNetworkProfiles(context)),
+                  ),
                 ListTile(
                   contentPadding: const EdgeInsets.symmetric(horizontal: 24),
                   leading: Icon(Icons.graphic_eq_rounded, color: accent),
@@ -120,6 +145,11 @@ class _AudioQualitySheet extends StatelessWidget {
       builder: (_) => const AudioSettingsDialog(bottomSheet: true),
     );
   }
+
+  Future<void> _openNetworkProfiles(BuildContext context) async {
+    final navigator = Navigator.of(context)..pop();
+    await showNetworkQualitySheet(navigator.context);
+  }
 }
 
 class _QualityOption extends StatelessWidget {
@@ -147,7 +177,10 @@ class _QualityOption extends StatelessWidget {
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
       onTap: selected
           ? null
-          : () => unawaited(PlaybackController.setQuality(value)),
+          : () {
+              unawaited(PlaybackController.setQuality(value));
+              unawaited(NetworkQualityController.recordManualQuality(value));
+            },
       leading: SizedBox(
         width: 36,
         child: Center(

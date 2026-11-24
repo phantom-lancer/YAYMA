@@ -16,22 +16,24 @@ enum AndroidAppearanceProfile {
 
 extension AndroidAppearanceProfileLabel on AndroidAppearanceProfile {
   String get title => switch (this) {
-    AndroidAppearanceProfile.yayama => 'YAYAMA',
-    AndroidAppearanceProfile.yandexMusic => 'Yandex Music',
-    AndroidAppearanceProfile.appleMusic => 'Apple Music / iOS 26',
-    AndroidAppearanceProfile.current => 'Текущий интерфейс',
+    AndroidAppearanceProfile.yayama => 'YAYMA Classic',
+    AndroidAppearanceProfile.yandexMusic => 'YAYMA / Liquid Glass',
+    AndroidAppearanceProfile.appleMusic => 'Apple Music',
+    AndroidAppearanceProfile.current => 'YAYMA Compact',
   };
 
   String get description => switch (this) {
-    AndroidAppearanceProfile.yayama => 'Оригинальный интерфейс приложения',
-    AndroidAppearanceProfile.yandexMusic => 'Компактная главная в стиле Яндекс Музыки',
-    AndroidAppearanceProfile.appleMusic => 'Liquid Glass и оформление Apple Music',
+    AndroidAppearanceProfile.yayama => 'Оригинальная волна и мини-плеер',
+    AndroidAppearanceProfile.yandexMusic =>
+      'Новая главная «Моя волна» и оптическое стекло',
+    AndroidAppearanceProfile.appleMusic =>
+      'Светлое стекло и композиция Apple Music',
     AndroidAppearanceProfile.current => 'Сохранённый Android-редизайн',
   };
 }
 
 final FlutterSignal<AndroidAppearanceProfile> androidAppearanceProfileSignal =
-    signal<AndroidAppearanceProfile>(AndroidAppearanceProfile.yayama);
+    signal<AndroidAppearanceProfile>(AndroidAppearanceProfile.yandexMusic);
 
 /// Kept for compatibility with code and preference files from earlier
 /// previews. New UI code should use [androidAppearanceProfileSignal].
@@ -57,7 +59,7 @@ abstract final class AndroidPlayerPreferences {
       'appleMusic' => AndroidAppearanceProfile.appleMusic,
       'current' => AndroidAppearanceProfile.current,
       'yayama' => AndroidAppearanceProfile.yayama,
-      _ => AndroidAppearanceProfile.yayama,
+      _ => AndroidAppearanceProfile.yandexMusic,
     };
   }
 

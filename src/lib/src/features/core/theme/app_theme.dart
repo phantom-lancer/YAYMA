@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:m3e_core/m3e_core.dart';
 import 'package:material_ui/material_ui.dart';
+import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 
 /// Material Orange 500 is the stable fallback before a cover palette is ready.
 const Color defaultAccentColor = Color(0xFFFF9800);
@@ -63,6 +64,81 @@ List<double> vibePalette(ColorScheme scheme) {
 }
 
 final ThemeData defaultAppTheme = buildAppTheme(baseColorScheme);
+
+/// Applies a whole-app visual profile on top of the cover-derived theme.
+///
+/// Apple's profile is more than a recolour: it swaps the dark neutral surfaces
+/// for the graphite iOS palette, tightens the large radii, and uses the Music
+/// red as the single accent while keeping the artwork's hue only as a faint
+/// ambient tint. The YAYMA profiles keep the existing theme untouched.
+ThemeData applyAppearanceTheme(
+  ThemeData base,
+  AndroidAppearanceProfile profile,
+) {
+  if (profile != AndroidAppearanceProfile.appleMusic) return base;
+  final cover = base.colorScheme;
+  const graphite = Color(0xFF1C1C1E);
+  final scheme = cover.copyWith(
+    primary: const Color(0xFFFF375F),
+    onPrimary: Colors.white,
+    primaryContainer: const Color(0xFF5C1020),
+    onPrimaryContainer: const Color(0xFFFFD9DF),
+    secondary: const Color(0xFFFF6482),
+    onSecondary: Colors.white,
+    surface: const Color(0xFF0E0E10),
+    surfaceContainerLowest: const Color(0xFF08080A),
+    surfaceContainerLow: const Color(0xFF141416),
+    surfaceContainer: graphite,
+    surfaceContainerHigh: const Color(0xFF242426),
+    surfaceContainerHighest: const Color(0xFF2C2C2E),
+    surfaceBright: const Color(0xFF3A3A3C),
+    surfaceDim: const Color(0xFF0E0E10),
+    onSurface: const Color(0xFFF5F5F7),
+    onSurfaceVariant: const Color(0xFFA1A1A6),
+    outline: const Color(0xFF3A3A3C),
+  );
+  return base.copyWith(
+    colorScheme: scheme,
+    scaffoldBackgroundColor: const Color(0xFF0A0A0C),
+    textTheme: base.textTheme.apply(
+      bodyColor: scheme.onSurface,
+      displayColor: scheme.onSurface,
+    ),
+    cardTheme: base.cardTheme.copyWith(
+      color: graphite,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+    ),
+    dialogTheme: base.dialogTheme.copyWith(
+      backgroundColor: const Color(0xF21C1C1E),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+    ),
+    bottomSheetTheme: base.bottomSheetTheme.copyWith(
+      backgroundColor: const Color(0xF21C1C1E),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+    ),
+    tabBarTheme: base.tabBarTheme.copyWith(
+      labelColor: scheme.onSurface,
+      unselectedLabelColor: scheme.onSurfaceVariant,
+    ),
+    inputDecorationTheme: base.inputDecorationTheme.copyWith(
+      fillColor: Colors.white.withValues(alpha: 0.06),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: BorderSide.none,
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: BorderSide.none,
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(12),
+        borderSide: const BorderSide(color: Color(0xFFFF375F), width: 1.6),
+      ),
+    ),
+  );
+}
 
 ThemeData buildAppTheme(ColorScheme scheme) {
   final base = ThemeData.dark(useMaterial3: true);

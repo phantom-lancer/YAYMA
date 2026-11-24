@@ -12,6 +12,7 @@ import 'package:yayma/src/features/auth/views/yandex_id_view.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
 import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/playback/views/android_wave_profiles.dart';
+import 'package:yayma/src/features/playback/views/my_wave_reference_view.dart';
 import 'package:yayma/src/features/core/views/layout/background.dart';
 import 'package:yayma/src/features/core/views/layout/mobile_full_player.dart';
 import 'package:yayma/src/features/core/views/layout/navigation_bar.dart';
@@ -236,6 +237,35 @@ class _AppLayoutState extends State<AppLayout>
                 profile == AndroidAppearanceProfile.yandexMusic ||
                 profile == AndroidAppearanceProfile.current;
             return showShader ? const WaveBackground() : const SizedBox.shrink();
+          },
+        ),
+      ),
+      // The reference "Моя волна" backdrop is a deep smoky violet whatever
+      // the artwork is. A translucent gradient over the shader keeps the
+      // motion and the cover hint but pins the screen to that palette.
+      Positioned.fill(
+        child: SignalBuilder(
+          builder: (context) {
+            final profile = androidAppearanceProfileSignal.value;
+            if (profile != AndroidAppearanceProfile.yandexMusic) {
+              return const SizedBox.shrink();
+            }
+            return const IgnorePointer(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Color(0x335B2A86),
+                      Color(0x66180A26),
+                      Color(0xB30B0412),
+                    ],
+                    stops: [0, 0.55, 1],
+                  ),
+                ),
+              ),
+            );
           },
         ),
       ),
@@ -580,8 +610,15 @@ class _WindowContent extends StatelessWidget {
           bottomPadding += MediaQuery.viewPaddingOf(context).bottom;
         } else if (state.section == AppSection.wave && isNarrow) {
           // Keep the wave controls and start button clear of the floating
-          // Android player bar and bottom navigation.
-          bottomPadding = 96 + MediaQuery.viewPaddingOf(context).bottom;
+          // Android player bar and bottom navigation. The custom profiles
+          // hide the mini-player entirely, so they only need to clear the
+          // floating navbar: reserving the player bar height there left a
+          // dead strip under the station shelf.
+          final profile = androidAppearanceProfileSignal.value;
+          bottomPadding = profile == AndroidAppearanceProfile.yayama
+              ? 96
+              : 78;
+          bottomPadding += MediaQuery.viewPaddingOf(context).bottom;
         } else if (isHome && isNarrow) {
           // Home is centered non-scrollable content: its bottom row
           // (wave settings, repeat, quality) must stay above the floating
@@ -639,7 +676,7 @@ class _WindowContent extends StatelessWidget {
           AndroidAppearanceProfile.yayama => const MyWaveView(
             key: ValueKey('yayama_wave'),
           ),
-          AndroidAppearanceProfile.yandexMusic => const YandexMusicWaveView(
+          AndroidAppearanceProfile.yandexMusic => const MyWaveReferenceView(
             key: ValueKey('yandex_wave'),
           ),
           AndroidAppearanceProfile.appleMusic => const AppleMusicWaveView(

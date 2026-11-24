@@ -59,5 +59,6 @@ flutter:
     - assets/icons/
 
   shaders:
+    - shaders/liquid_glass.frag
     - shaders/vibe_aurora.frag
     - shaders/vibe_wave.frag

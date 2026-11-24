@@ -4,9 +4,15 @@ import android.os.Bundle
 import androidx.core.content.FileProvider
 import com.ryanheise.audioservice.AudioServiceActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.content.Context
 import android.content.Intent
@@ -16,8 +22,11 @@ import java.io.File
 class MainActivity : AudioServiceActivity() {
     private val CHANNEL = "io.github.darkplayoff.yayma/wifilock"
     private val UPDATER_CHANNEL = "io.github.darkplayoff.yayma/updater"
+    private val NETWORK_CHANNEL = "io.github.darkplayoff.yayma/network"
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var networkSink: EventChannel.EventSink? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -46,6 +55,28 @@ class MainActivity : AudioServiceActivity() {
             }
         }
 
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, NETWORK_CHANNEL).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getNetworkType" -> result.success(currentNetworkType())
+                else -> result.notImplemented()
+            }
+        }
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, "$NETWORK_CHANNEL/events").setStreamHandler(
+            object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                    networkSink = events
+                    events.success(currentNetworkType())
+                    registerNetworkCallback()
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    networkSink = null
+                    unregisterNetworkCallback()
+                }
+            }
+        )
+
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, UPDATER_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "getSupportedAbis" -> result.success(android.os.Build.SUPPORTED_ABIS.toList())
@@ -70,6 +101,66 @@ class MainActivity : AudioServiceActivity() {
                 else -> result.notImplemented()
             }
         }
+    }
+
+    private fun currentNetworkType(): String {
+        return try {
+            val manager = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val network = manager.activeNetwork ?: return "none"
+            val capabilities = manager.getNetworkCapabilities(network) ?: return "unknown"
+            when {
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "mobile"
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
+                else -> "other"
+            }
+        } catch (e: Exception) {
+            "unknown"
+        }
+    }
+
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        try {
+            val manager = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = publishNetworkType()
+
+                override fun onLost(network: Network) = publishNetworkType()
+
+                override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) =
+                    publishNetworkType()
+            }
+            networkCallback = callback
+            manager.registerDefaultNetworkCallback(callback)
+        } catch (e: Exception) {
+            // Keep the last known type if the platform refuses a callback.
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val callback = networkCallback ?: return
+        networkCallback = null
+        try {
+            val manager = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            manager.unregisterNetworkCallback(callback)
+        } catch (e: Exception) {
+            // Already unregistered with the engine.
+        }
+    }
+
+    private fun publishNetworkType() {
+        val sink = networkSink ?: return
+        Handler(Looper.getMainLooper()).post {
+            if (networkSink === sink) sink.success(currentNetworkType())
+        }
+    }
+
+    override fun onDestroy() {
+        unregisterNetworkCallback()
+        networkSink = null
+        super.onDestroy()
     }
 
     private fun canInstallPackages(): Boolean =

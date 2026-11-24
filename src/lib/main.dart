@@ -12,6 +12,7 @@ import 'package:yayma/src/app/window_placement.dart';
 import 'package:yayma/src/features/auth/views/auth/auth_screens.dart';
 import 'package:yayma/src/features/core/providers/navigation_provider.dart';
 import 'package:yayma/src/features/core/providers/notification_provider.dart';
+import 'package:yayma/src/features/core/providers/android_player_preferences.dart';
 import 'package:yayma/src/features/core/services/app_logger.dart';
 import 'package:yayma/src/features/core/services/global_hotkey_service.dart';
 import 'package:yayma/src/features/core/theme/app_theme.dart';
@@ -126,8 +127,13 @@ class MyApp extends StatelessWidget {
     return SignalBuilder(
       builder: (context) {
         // The whole ThemeData arrives prebuilt from the cover-palette path,
-        // so a track change does no colour math in this build.
-        final theme = appThemeSignal() ?? defaultAppTheme;
+        // so a track change does no colour math in this build. The appearance
+        // profile then layers a complete visual system on top.
+        final profile = androidAppearanceProfileSignal();
+        final theme = applyAppearanceTheme(
+          appThemeSignal() ?? defaultAppTheme,
+          profile,
+        );
 
         return MaterialApp(
           title: 'YAYMA',

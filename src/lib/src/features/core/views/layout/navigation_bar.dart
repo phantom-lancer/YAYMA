@@ -195,7 +195,8 @@ class _FloatingNavBarState extends State<FloatingNavBar>
             ),
           _NavIcon(
             icon: Icons.search_rounded,
-            label: 'Поиск',
+            label: Platform.isAndroid ? null : 'Поиск',
+            tooltip: 'Поиск',
             maxLabelWidth: labelMaxWidth,
             isSelected: currentSection == AppSection.search,
             onTap: () => setSection(AppSection.search),
@@ -211,7 +212,8 @@ class _FloatingNavBarState extends State<FloatingNavBar>
             ),
           _NavIcon(
             icon: Icons.library_music_rounded,
-            label: 'Библиотека',
+            label: Platform.isAndroid ? null : 'Библиотека',
+            tooltip: 'Библиотека',
             maxLabelWidth: labelMaxWidth,
             isSelected:
                 currentSection == AppSection.liked ||
@@ -309,12 +311,23 @@ class _FloatingNavBarState extends State<FloatingNavBar>
                             ),
                           ),
                           child: isNarrow
-                              ? Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  mainAxisAlignment:
-                                      MainAxisAlignment.spaceEvenly,
-                                  children: children,
-                                )
+                              ? (Platform.isAndroid
+                                    ? Row(
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.spaceEvenly,
+                                        children: [
+                                          for (final child in children)
+                                            Expanded(
+                                              child: Center(child: child),
+                                            ),
+                                        ],
+                                      )
+                                    : Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.spaceEvenly,
+                                        children: children,
+                                      ))
                               : Column(
                                   mainAxisSize: MainAxisSize.min,
                                   children: children,
